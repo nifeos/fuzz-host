@@ -30,12 +30,12 @@ for t in tests/*-selftest; do
     fi
 done
 
-if [ "$ran" -eq 0 ]; then
-    echo "script/test: no selftest found under tests/" >&2
-    exit 1
-fi
 if [ -n "$failed" ]; then
     echo "script/test: FAILED:$failed" >&2
+    exit 1
+fi
+if [ "$ran" -eq 0 ]; then
+    echo "script/test: no selftest found under tests/" >&2
     exit 1
 fi
 echo "script/test: $ran selftests passed"
