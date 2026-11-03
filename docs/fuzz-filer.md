@@ -111,17 +111,17 @@ test with planted seeds, and a fake GitHub on 127.0.0.1.
 
 ## Which account it runs as
 
-**Open: this needs an architect's ruling before the timer is enabled.**
+Ruled 2026-11-03: the filer keeps `User=lane`, the account that also runs the fuzzed code. That is
+the only account that can read the held directory today: the supervisor makes it mode 0700 before
+every window, inside the fuzz account's home, which no other account can enter.
 
-The unit ships with `User=lane`, the account the supervisor runs as. That is the only account that
-can read the held directory today: the supervisor makes it mode 0700 before every window, inside the
-fuzz account's home, which no other account can enter. It is also the reader `fuzz-token` gives the
-filer token by default. The proposal puts the filer beside the supervisor, reading that directory,
-so it runs as that account too.
+**Accepted risk.** The host runs main's code unattended as that account, and the filer token lets
+its holder create, edit and publish any advisory on nifeos/nife. So code that reaches main runs as
+an account able to read the filer token, and could publish a held finding before its fix. A
+published advisory cannot be unpublished. The protection is that main requires pull requests and
+checks.
 
-The cost: the host runs main's code unattended as that account, and the filer token lets its holder
-create, edit and publish any advisory on nifeos/nife. So any code that reaches main can read the
-token and publish a held finding before its fix. A published advisory cannot be unpublished.
+Ruled 2026-11-03: tokens stay at one hour, and no long-lived credential is kept for the filer.
 
 A separate account (for example `fuzz-filer`) would keep the token from the fuzz account; the mint
 helper already supports it with no change ([fuzz-token.md](fuzz-token.md#giving-a-profile-its-own-account)).
@@ -131,13 +131,13 @@ filer alone. Neither is in the proposal. Giving the filer `CAP_DAC_READ_SEARCH` 
 read every file on the host, the App key included, so that is no option.
 
 The filer itself does not care which account runs it: every path is a flag, and the ledger lives in
-the unit's own state directory. Whichever account is chosen, the change here is the unit's `User=`
-and `Group=` and the token's reader.
+the unit's own state directory. Should the ruling change, the change here is the unit's `User=` and
+`Group=` and the token's reader.
 
 ## Install, for a person with root on the fuzz host
 
 Do this after the key is in place and `fuzz-token` is installed (steps P4 and P6 of nife's
-`notes/fuzzing/finishing-the-setup.md`), and after the architect has ruled on the account above.
+`notes/fuzzing/finishing-the-setup.md`), and with the accepted risk above in mind.
 Fetch this repository into your own account, not the fuzz account, and review the commit you
 install.
 
@@ -194,7 +194,7 @@ listing alone to avoid filing twice.
 
 ## BUGS
 
-- The account it runs as is open (above).
+- The filer runs as the fuzz account, an accepted risk (above).
 - No one has run it against GitHub or under systemd yet. `systemd-analyze verify` passes on the
   units; the first install confirms the hardening lines leave it working, and the first real create
   confirms that GitHub accepts `<= <commit>` as a range for the ecosystem `other` (unverified; a
