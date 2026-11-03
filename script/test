@@ -5,7 +5,8 @@
 #
 # A selftest is an executable file in tests/ whose name ends in -selftest. Each one runs from the
 # repository root, needs no network and no real credential, and exits non-zero on failure. This
-# script runs them all, names each failure, and exits 1 when any failed or when none was found.
+# script runs them all, names each failure, and exits 1 when any failed, when none was found, or
+# when a file named *-selftest is not executable (it would otherwise be skipped silently).
 #
 # Name: provisional.
 
@@ -16,7 +17,12 @@ cd "$(dirname "$0")/.." || exit 1
 ran=0
 failed=""
 for t in tests/*-selftest; do
-    [ -x "$t" ] || continue
+    [ -e "$t" ] || continue
+    if [ ! -x "$t" ]; then
+        echo "script/test: $t is not executable" >&2
+        failed="$failed $t"
+        continue
+    fi
     ran=$((ran + 1))
     echo "== $t"
     if ! "$t"; then
@@ -24,12 +30,12 @@ for t in tests/*-selftest; do
     fi
 done
 
-if [ "$ran" -eq 0 ]; then
-    echo "script/test: no selftest found under tests/" >&2
-    exit 1
-fi
 if [ -n "$failed" ]; then
     echo "script/test: FAILED:$failed" >&2
+    exit 1
+fi
+if [ "$ran" -eq 0 ]; then
+    echo "script/test: no selftest found under tests/" >&2
     exit 1
 fi
 echo "script/test: $ran selftests passed"
