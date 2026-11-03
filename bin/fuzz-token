@@ -1,10 +1,16 @@
 #!/usr/bin/python3 -IS
-"""fuzz-token: mint one narrowed installation token of the nife-fuzz GitHub App for one service.
+"""fuzz-token: mint one narrowed installation token of a nife fuzz GitHub App for one profile.
 
     fuzz-token mint PROFILE [--reader USER] [--group GROUP] [--key PATH] [--out-dir DIR]
                     [--api URL] [--openssl PATH]
-    fuzz-token check PROFILE [--out-dir DIR] [--api URL]
+    fuzz-token issue PROFILE [--key PATH] [--api URL] [--openssl PATH]
+    fuzz-token check PROFILE [--group GROUP] [--out-dir DIR] [--api URL]
+    fuzz-token check PROFILE --fresh [--key PATH] [--api URL] [--openssl PATH]
     fuzz-token profiles
+
+Each profile belongs to one App. `publish` and `filer` belong to `nife-fuzz`, whose key sits on the
+fuzz host; `reader` belongs to `nife-fuzz-reader`, whose key sits on the machine that launches fix
+lanes. The App's id, installation id and key path come from the profile.
 
 `mint` reads the App's private key from a root-only file, signs a JSON Web Token (RS256, through
 the `openssl` binary, the key handed over on a pipe), and exchanges it for an installation token
@@ -24,9 +30,19 @@ root's:
 `fuzz-token@<profile>.timer` runs `mint` every 20 minutes, so a reader always holds a token with
 at least 40 minutes left.
 
+`issue` mints the same way and writes the token, and nothing else, to standard output, for a
+caller that runs it through a sudo rule naming exactly `issue reader` and hands the token to one
+command. It refuses when standard output is a terminal, when the profile is not marked for it (only
+`reader` is), and, under sudo, when any of `--key`, `--api` or `--openssl` is given. It clears its
+environment before it mints. When the token cannot be written it revokes it. docs/fuzz-token-reader.md
+has the rule.
+
 `check` reads that file, asks GitHub which repositories the token reaches, and prints the list,
 the expiry and the recorded permissions. It never prints the token. It exits 1 unless the list is
-exactly nifeos/nife and the token is unexpired.
+exactly nifeos/nife and the token is unexpired. `check --fresh` reads the key instead, mints a
+token, prints the permissions GitHub granted, the repositories it reaches and its expiry, revokes it,
+and exits 1 unless the list is exactly nifeos/nife and the revocation succeeded. `mint` and `issue`
+have already refused any grant but the profile's permissions.
 
 `profiles` prints each profile, its permissions, its default reader and its default group.
 
@@ -34,19 +50,22 @@ Each profile's token is narrower than the App, but two profiles whose readers ar
 no isolation between them: that account holds both tokens. `--reader` and `--group` are per profile,
 so a profile gets its own account through a drop-in on its unit, with no change here.
 
-The key never leaves this process except on the pipe to `openssl`. Neither the key nor a token
-appears in an argument list, on standard output, on standard error or in an error message, and the
-token file is the only place a token is written. The key file must be a regular file (not a link),
-owned by the user running this, mode 0400, in a directory owned by that user, mode 0700; anything
-else is refused before the file is read. On the host that user is root.
+The key never leaves this process except on the pipe to `openssl`. The key never appears in an
+argument list, on standard output, on standard error or in an error message. A token never appears
+in an argument list, on standard error or in an error message, and on standard output only from
+`issue`; the token file, or for `issue` the caller's pipe, is the only place a token is written. The
+key file must be a regular file (not a link), owned by the user running this, mode 0400, without a
+POSIX ACL, in a directory owned by that user, mode 0700, without a POSIX ACL; anything else is
+refused before the file is read. On the host that user is root.
 
 `--reader` and `--group` exist for a drop-in that gives a profile its own account. `--key`,
 `--out-dir`, `--api` and `--openssl` exist for the selftest; the installed unit passes none of them.
 `--api` accepts https://api.github.com and plain http to a literal loopback address and nothing
-else, and the helper refuses every HTTP redirect.
+else, the helper refuses every HTTP redirect, and it ignores proxy settings in its environment.
 
-Name: provisional, as are the profile names and the paths. docs/fuzz-token.md has the install
-steps for a person with root.
+Name: provisional, as are the profile names, the `issue` subcommand, the `--fresh` flag and the
+paths. docs/fuzz-token.md has the install steps for a person with root on the fuzz host, and
+docs/fuzz-token-reader.md those for the machine that launches fix lanes.
 
 BUGS
 
@@ -54,8 +73,10 @@ BUGS
   The process lives a few seconds.
 - GitHub's answer lists the repositories only when the request names them. This helper always names
   nife, and refuses an answer without the list.
-- Both profiles default to the reader `lane`, so until each has its own account the split narrows
-  each token but isolates nothing between them.
+- `publish` and `filer` both default to the reader `lane`, so until each has its own account the
+  split narrows each token but isolates nothing between them.
+- `issue` trusts the sudo rule to pin its arguments; it refuses the selftest flags under sudo as a
+  second line, and it cannot tell one lane from another, since every lane runs as one account.
 """
 
 import argparse
@@ -76,31 +97,50 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-APP_ID = "5571801"
-INSTALLATION_ID = "177641059"
 OWNER = "nifeos"
 REPOSITORY = "nife"
 FULL_NAME = OWNER + "/" + REPOSITORY
 
-DEFAULT_KEY = "/etc/nife-fuzz/nife-fuzz.private-key.pem"
 DEFAULT_OUT_DIR = "/run/fuzz-token"
 DEFAULT_API = "https://api.github.com"
 DEFAULT_OPENSSL = "/usr/bin/openssl"
+# Where the install steps put this helper; a refusal message names it.
+INSTALLED = "/usr/local/sbin/fuzz-token"
 # openssl runs with this PATH and nothing else in its environment.
 OPENSSL_ENV = {"PATH": "/usr/bin:/bin"}
 # What GitHub's installation tokens look like today (ghs_ and 36 characters); anything else is
 # refused rather than written into a file systemd parses.
 TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_]{1,255}")
 
-# One token per service, each narrowed below the App's permissions (Contents write and Repository
-# security advisories write; GitHub adds Metadata read to every token). The reader and group are
-# defaults; a unit drop-in overrides them per profile.
-PROFILES = {
-    "publish": {"permissions": {"contents": "write"}, "reader": "lane",
-                "what": "the daily fuzz release (gh release create)"},
-    "filer": {"permissions": {"repository_advisories": "write"}, "reader": "lane",
-              "what": "the finding filer (private security advisories)"},
+# The two Apps. Neither id is secret. Each key path is a root-only file on the one machine that
+# holds that App's key: nife-fuzz on the fuzz host, nife-fuzz-reader on the machine that launches
+# fix lanes, and never both on one machine.
+APPS = {
+    "nife-fuzz": {"app_id": "5571801", "installation_id": "177641059",
+                  "key": "/etc/nife-fuzz/nife-fuzz.private-key.pem"},
+    "nife-fuzz-reader": {"app_id": "5571868", "installation_id": "177642435",
+                         "key": "/etc/nife-fuzz-reader/nife-fuzz-reader.private-key.pem"},
 }
+
+# One token per service, each narrowed to the profile's permissions (nife-fuzz holds Contents write
+# and Repository security advisories write, nife-fuzz-reader Repository security advisories read;
+# GitHub adds Metadata read to every token). The reader and group are defaults for `mint`; a unit
+# drop-in overrides them per profile. `issue` marks the one profile whose token may go to standard
+# output.
+PROFILES = {
+    "publish": {"app": "nife-fuzz", "permissions": {"contents": "write"}, "reader": "lane",
+                "issue": False, "what": "the daily fuzz release (gh release create)"},
+    "filer": {"app": "nife-fuzz", "permissions": {"repository_advisories": "write"},
+              "reader": "lane", "issue": False,
+              "what": "the finding filer (private security advisories)"},
+    "reader": {"app": "nife-fuzz-reader", "permissions": {"repository_advisories": "read"},
+               "reader": None, "issue": True,
+               "what": "a fix lane reading one advisory (issue, through a sudo rule)"},
+}
+
+
+def app_of(profile):
+    return APPS[PROFILES[profile]["app"]]
 # What GitHub grants beside the request without being asked.
 IMPLICIT = {"metadata": "read"}
 
@@ -141,9 +181,10 @@ def check_key(path, uid):
     """The key's bytes, after checking its directory and the file itself.
 
     The directory is opened without following a link and checked on its descriptor: a directory
-    owned by `uid`, mode 0700. The key is opened relative to that descriptor, again without
-    following a link and without blocking on a FIFO, and checked on its own descriptor: a regular
-    file owned by `uid`, mode 0400. Anything else refuses before a byte is read."""
+    owned by `uid`, mode 0700, without a POSIX ACL. The key is opened relative to that descriptor,
+    again without following a link and without blocking on a FIFO, and checked on its own
+    descriptor: a regular file owned by `uid`, mode 0400, without a POSIX ACL. Anything else
+    refuses before a byte is read."""
     path = os.path.abspath(path)
     directory, name = os.path.split(path)
     try:
@@ -157,6 +198,10 @@ def check_key(path, uid):
             raise Refusal("the key directory %s is owned by uid %d with mode %s; it must be uid "
                           "%d, mode %04o" % (directory, dst.st_uid, mode_text(dst), uid,
                                              KEY_DIR_MODE))
+        acl = posix_acls(dfd)
+        if acl:
+            raise Refusal("the key directory %s carries a POSIX ACL (%s); remove it with "
+                          "setfacl -b -k" % (directory, ", ".join(acl)))
         try:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY |
                          os.O_NONBLOCK, dir_fd=dfd)
@@ -172,6 +217,10 @@ def check_key(path, uid):
         if st.st_uid != uid or stat.S_IMODE(st.st_mode) != KEY_MODE:
             raise Refusal("the key file %s is owned by uid %d with mode %s; it must be uid %d, "
                           "mode %04o" % (path, st.st_uid, mode_text(st), uid, KEY_MODE))
+        acl = posix_acls(fd)
+        if acl:
+            raise Refusal("the key file %s carries a POSIX ACL (%s); remove it with setfacl -b"
+                          % (path, ", ".join(acl)))
         chunks = []
         while True:
             b = os.read(fd, 65536)
@@ -186,15 +235,15 @@ def check_key(path, uid):
     return key
 
 
-def sign_jwt(key, openssl=DEFAULT_OPENSSL, now=None):
-    """A JSON Web Token for the App, signed with `key` through `openssl`.
+def sign_jwt(key, app_id, openssl=DEFAULT_OPENSSL, now=None):
+    """A JSON Web Token for the App `app_id`, signed with `key` through `openssl`.
 
     iat is backdated 60 seconds and exp set 540 seconds ahead, inside GitHub's ten-minute ceiling,
     for clock drift between this host and GitHub. The key travels on openssl's standard input; the
     signing input, which is not secret, goes in a private temporary file."""
     now = int(now if now is not None else time.time())
     header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    claims = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": APP_ID},
+    claims = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": app_id},
                                separators=(",", ":")).encode())
     signing_input = "%s.%s" % (header, claims)
     with tempfile.TemporaryDirectory(prefix="fuzz-token.") as tmp:
@@ -219,7 +268,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
                       % (req.get_method(), urllib.parse.urlsplit(req.full_url).path, code))
 
 
-OPENER = urllib.request.build_opener(NoRedirect)
+# An empty ProxyHandler: no proxy variable in the environment reroutes a call.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
 
 
 def check_api(api):
@@ -294,9 +344,12 @@ def parse_expiry(text):
 
 
 def exchange(api, jwt, profile):
-    """(token, expires_at) narrowed to the profile's permissions on nifeos/nife alone."""
+    """(token, expires_at, granted permissions) narrowed to the profile's permissions on
+    nifeos/nife alone."""
     wanted = PROFILES[profile]["permissions"]
-    _, minted = call(api, "POST", "/app/installations/%s/access_tokens" % INSTALLATION_ID, jwt,
+    _, minted = call(api, "POST",
+                     "/app/installations/%s/access_tokens" % app_of(profile)["installation_id"],
+                     jwt,
                      {"repositories": [REPOSITORY], "permissions": wanted})
     if not isinstance(minted, dict) or not isinstance(minted.get("token"), str) \
             or not minted["token"]:
@@ -333,7 +386,7 @@ def exchange(api, jwt, profile):
         raise Refusal("refused the %s token: %s; %s" % (
             profile, "; ".join(problems),
             "revoked it" if revoked else "could not revoke it, so it lapses within the hour"))
-    return token, expires
+    return token, expires, granted
 
 
 def prepare_out_dir(out_dir, uid):
@@ -358,10 +411,11 @@ def prepare_out_dir(out_dir, uid):
 
 
 def posix_acls(path):
-    """The POSIX ACL attributes on `path`, not following a link. A file system without extended
-    attributes has none."""
+    """The POSIX ACL attributes on `path` (a path, not following a link, or an open descriptor). A
+    file system without extended attributes has none."""
     try:
-        names = os.listxattr(path, follow_symlinks=False)
+        names = os.listxattr(path) if isinstance(path, int) else \
+            os.listxattr(path, follow_symlinks=False)
     except OSError:
         return []
     return sorted(n for n in names if n in ACL_XATTRS)
@@ -497,16 +551,19 @@ def mint(args):
     profile = args.profile
     api = check_api(args.api)
     try:
-        reader = reader_account(args.reader or PROFILES[profile]["reader"])
+        name = args.reader or PROFILES[profile]["reader"]
+        if not name:
+            raise Refusal("the %s profile has no default reader; name one with --reader" % profile)
+        reader = reader_account(name)
         group = reader_group(args.group or "fuzz-token-" + profile, reader)
     except Refusal as e:
         raise Refusal("%s; %s" % (e, discard_stale(api, args.out_dir, profile)))
     uid = os.geteuid()
-    key = check_key(args.key, uid)
+    key = check_key(args.key or app_of(profile)["key"], uid)
     prepare_out_dir(args.out_dir, uid)
-    jwt = sign_jwt(key, args.openssl)
+    jwt = sign_jwt(key, app_of(profile)["app_id"], args.openssl)
     del key
-    token, expires = exchange(api, jwt, profile)
+    token, expires, _ = exchange(api, jwt, profile)
     path = write_token(args.out_dir, profile, reader, group, token, expires)
     print("fuzz-token: wrote %s for %s (group %s): %s on %s, expires %s" % (
         path, reader.pw_name, group.gr_name, permissions_text(PROFILES[profile]["permissions"]), FULL_NAME,
@@ -514,7 +571,92 @@ def mint(args):
     return 0
 
 
+def mint_once(profile, key_path, api, openssl):
+    """(api, token, expires, granted) for one fresh token of `profile`, after every check `mint`
+    makes on the key and the answer."""
+    api = check_api(api)
+    key = check_key(key_path or app_of(profile)["key"], os.geteuid())
+    jwt = sign_jwt(key, app_of(profile)["app_id"], openssl)
+    del key
+    token, expires, granted = exchange(api, jwt, profile)
+    return api, token, expires, granted
+
+
+def write_all(fd, data):
+    while data:
+        n = os.write(fd, data)
+        data = data[n:]
+
+
+def issue(args):
+    """Mint one token and write it, alone on one line, to standard output."""
+    profile = args.profile
+    if not PROFILES[profile]["issue"]:
+        raise Refusal("the %s profile is for a service and is never issued on standard output; "
+                      "its token goes to a file through mint" % profile)
+    overrides = ["--" + n for n in ("key", "api", "openssl") if getattr(args, n) is not None]
+    if overrides and ("SUDO_UID" in os.environ or "SUDO_USER" in os.environ):
+        raise Refusal("%s exist for the selftest and are refused under sudo"
+                      % ", ".join(overrides))
+    if os.isatty(1):
+        raise Refusal("standard output is a terminal; issue prints a token, so it writes only to "
+                      "a pipe, as in GH_TOKEN=\"$(sudo -n %s issue %s)\" <command>"
+                      % (INSTALLED, profile))
+    asker = os.environ.get("SUDO_USER") or "uid %d" % os.getuid()
+    # Nothing from the caller's environment reaches the mint: no proxy, no certificate path, no
+    # temporary directory. openssl gets its own environment, as on every other path.
+    os.environ.clear()
+    os.environ["PATH"] = OPENSSL_ENV["PATH"]
+    api, token, expires, _ = mint_once(profile, args.key, args.api or DEFAULT_API,
+                                       args.openssl or DEFAULT_OPENSSL)
+    try:
+        write_all(1, (token + "\n").encode())
+    except OSError as e:
+        raise Refusal("could not write the token to standard output (%s); %s" % (
+            e.strerror, "revoked it" if revoke(api, token) else
+            "could not revoke it, so it lapses within the hour"))
+    print("fuzz-token: issued one %s token to %s: %s on %s, expires %s; nothing stores it"
+          % (profile, asker, permissions_text(PROFILES[profile]["permissions"]), FULL_NAME,
+             expires.strftime("%Y-%m-%dT%H:%M:%SZ")), file=sys.stderr)
+    return 0
+
+
+def check_fresh(args):
+    """Mint a token, report what GitHub granted and what it reaches, and revoke it."""
+    profile = args.profile
+    api, token, expires, granted = mint_once(profile, args.key, args.api or DEFAULT_API,
+                                             args.openssl or DEFAULT_OPENSSL)
+    try:
+        _, listing = call(api, "GET", "/installation/repositories?per_page=100", token)
+    finally:
+        revoked = revoke(api, token)
+    repos = listing.get("repositories") if isinstance(listing, dict) else None
+    names = sorted(r.get("full_name", "?") for r in repos if isinstance(r, dict)) \
+        if isinstance(repos, list) else []
+    app = PROFILES[profile]["app"]
+    print("profile: %s" % profile)
+    print("app: %s (App ID %s, installation %s)" % (app, APPS[app]["app_id"],
+                                                    APPS[app]["installation_id"]))
+    print("permissions: %s" % permissions_text(granted))
+    print("expires: %s" % expires.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    print("repositories: %s" % (" ".join(names) or "none"))
+    print("revoked: %s" % ("yes" if revoked else "no"))
+    problems = []
+    if names != [FULL_NAME]:
+        problems.append("the token must reach %s alone" % FULL_NAME)
+    if not revoked:
+        problems.append("the check's token could not be revoked, so it lapses within the hour")
+    for p in problems:
+        print("fuzz-token: %s" % p, file=sys.stderr)
+    return 1 if problems else 0
+
+
 def check(args):
+    if args.fresh:
+        return check_fresh(args)
+    if args.key is not None or args.openssl is not None:
+        raise Refusal("--key and --openssl apply to check --fresh alone")
+    args.api = args.api or DEFAULT_API
     path = os.path.join(args.out_dir, args.profile + ".env")
     st, fields = read_token_file(path)
     try:
@@ -562,8 +704,9 @@ def check(args):
 
 def profiles(_args):
     for name, p in sorted(PROFILES.items()):
-        print("%s\t%s\treader %s\tgroup fuzz-token-%s\t%s" % (
-            name, permissions_text(p["permissions"]), p["reader"], name, p["what"]))
+        print("%s\t%s\t%s\treader %s\tgroup fuzz-token-%s\t%s" % (
+            name, p["app"], permissions_text(p["permissions"]), p["reader"] or "(none)", name,
+            p["what"]))
     return 0
 
 
@@ -575,16 +718,27 @@ def main(argv):
     m.add_argument("profile", choices=sorted(PROFILES))
     m.add_argument("--reader", help="the account that may read the token file")
     m.add_argument("--group", help="the token file's group; it must hold the reader alone")
-    m.add_argument("--key", default=DEFAULT_KEY)
+    m.add_argument("--key", help="the App key, if not the profile's own path")
     m.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     m.add_argument("--api", default=DEFAULT_API)
     m.add_argument("--openssl", default=DEFAULT_OPENSSL)
     m.set_defaults(run=mint)
+    i = sub.add_parser("issue", help="mint a token and write it to standard output (reader alone)")
+    i.add_argument("profile", choices=sorted(PROFILES))
+    i.add_argument("--key")
+    i.add_argument("--api")
+    i.add_argument("--openssl")
+    i.set_defaults(run=issue)
     c = sub.add_parser("check", help="print the token's repositories and expiry, never the token")
     c.add_argument("profile", choices=sorted(PROFILES))
+    c.add_argument("--fresh", action="store_true",
+                   help="mint a token from the key, report it and revoke it, instead of reading "
+                        "the token file")
     c.add_argument("--group", help="the group the file must have, if not fuzz-token-PROFILE")
     c.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
-    c.add_argument("--api", default=DEFAULT_API)
+    c.add_argument("--api")
+    c.add_argument("--key")
+    c.add_argument("--openssl")
     c.set_defaults(run=check)
     p = sub.add_parser("profiles", help="list the profiles")
     p.set_defaults(run=profiles)

@@ -1,0 +1,512 @@
+#!/usr/bin/python3 -IS
+"""tests/fuzz-token-reader-selftest: the `reader` profile of bin/fuzz-token, and `issue`, the way a
+fix lane gets its token, against a throwaway key and a local stub of GitHub.
+
+No real key, no real token and no network. The test generates an RSA key with `openssl` and serves
+the calls the helper makes from a stub on 127.0.0.1 that answers only for the nife-fuzz-reader
+App's installation. It checks:
+
+- that `issue reader` writes exactly one line, the token, to standard output, and the expiry, never
+  the token, to standard error;
+- that the JSON Web Token names the reader App (5571868), verifies against the throwaway key, and
+  goes to the reader App's installation (177642435), and that the exchange asks for Repository
+  security advisories read on nife alone;
+- that `issue` refuses a terminal on standard output, a profile other than `reader`, and, under
+  sudo, each of `--key`, `--api` and `--openssl`, all before any request;
+- that, run as sudo runs it (no flags, SUDO_UID set), it reads the reader App's own key path and
+  mints;
+- that a proxy in the caller's environment reroutes nothing, and that `openssl` sees PATH alone;
+- that an answer granting more, granting write in place of read, or reaching a second repository is
+  refused, revoked, and puts nothing on standard output;
+- that a token which cannot be written, because the reader of the pipe has gone, is revoked;
+- that the reader key is refused when it is missing, has the wrong mode or owner, sits in a
+  directory with the wrong mode, is reached through a link, or carries a POSIX ACL (on the file or
+  on its directory), before any request;
+- that `check reader --fresh` prints the granted permissions, the repository list and the expiry,
+  revokes its token, never prints it, and fails on a second repository;
+- that `mint reader` needs a named reader and, given one, writes the token file;
+- that no output but `issue`'s standard output, no argument list and no file but the key and the
+  token file ever holds the key, a token or a JSON Web Token.
+
+Name: provisional.
+"""
+
+import base64
+import grp
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pty
+import pwd
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HELPER = os.path.join(ROOT, "bin", "fuzz-token")
+ME = os.geteuid()
+MY_NAME = pwd.getpwuid(ME).pw_name
+MY_GROUP = grp.getgrgid(os.getegid()).gr_name
+READER_INSTALLATION = "177642435"
+READER_APP = "5571868"
+WANTED = {"repositories": ["nife"], "permissions": {"repository_advisories": "read"}}
+
+failures = []
+
+
+def check(name, ok, detail=""):
+    print("%s %s" % ("ok  " if ok else "FAIL", name))
+    if not ok:
+        failures.append(name)
+        if detail:
+            print("     " + str(detail)[:400])
+
+
+def unb64(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def load_helper():
+    loader = importlib.machinery.SourceFileLoader("fuzz_token", HELPER)
+    spec = importlib.util.spec_from_loader("fuzz_token", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+MOD = load_helper()
+
+
+def refused(fn, *args):
+    try:
+        return False, fn(*args)
+    except MOD.Refusal as e:
+        return True, str(e)
+
+
+def main():
+    tmp = tempfile.mkdtemp(prefix="fuzz-token-reader-selftest.")
+    os.chmod(tmp, 0o700)
+    servers = []
+    try:
+        return run(tmp, servers.append)
+    finally:
+        for s in servers:
+            s.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run(tmp, keep_server):
+    real_openssl = shutil.which("openssl")
+    if not real_openssl:
+        print("fuzz-token-reader-selftest: openssl is not installed", file=sys.stderr)
+        return 1
+
+    keydir = os.path.join(tmp, "etc-nife-fuzz-reader")
+    os.mkdir(keydir, 0o700)
+    key = os.path.join(keydir, "key.pem")
+    pub = os.path.join(tmp, "pub.pem")
+    subprocess.run([real_openssl, "genpkey", "-algorithm", "RSA", "-pkeyopt",
+                    "rsa_keygen_bits:2048", "-out", key], check=True, capture_output=True)
+    subprocess.run([real_openssl, "pkey", "-in", key, "-pubout", "-out", pub], check=True,
+                   capture_output=True)
+    os.chmod(key, 0o400)
+    with open(key) as f:
+        key_lines = [l for l in f.read().splitlines() if l and not l.startswith("-----")]
+
+    # The openssl wrapper logs its arguments and the names in its environment.
+    bindir = os.path.join(tmp, "bin")
+    os.mkdir(bindir)
+    argv_log = os.path.join(tmp, "openssl-argv.log")
+    env_log = os.path.join(tmp, "openssl-env.log")
+    # How many of the helper's temporary directories sat in the caller's TMPDIR at each signing.
+    tmp_log = os.path.join(tmp, "openssl-tmpdir.log")
+    wrapper = os.path.join(bindir, "openssl")
+    with open(wrapper, "w") as f:
+        f.write('#!/bin/sh\n'
+                'printf "%%s\\n" "$*" >> "%(log)s"\n'
+                'env | cut -d= -f1 | sort | tr "\\n" " " >> "%(envlog)s"; echo >> "%(envlog)s"\n'
+                'n=0; for d in "%(tmp)s"/fuzz-token.*; do [ -d "$d" ] && n=$((n + 1)); done\n'
+                'echo "$n" >> "%(tmplog)s"\n'
+                'exec "%(real)s" "$@"\n' % {"log": argv_log, "envlog": env_log,
+                                           "tmp": tmp, "tmplog": tmp_log, "real": real_openssl})
+    os.chmod(wrapper, 0o755)
+
+    state = {"mode": "ok", "bodies": [], "paths": [], "jwts": [], "issued": [], "revoked": [],
+             "bad_jwt": 0, "decoy_hits": 0, "repo_listing": ["nifeos/nife"]}
+
+    def verify_jwt(jwt):
+        parts = jwt.split(".")
+        if len(parts) != 3:
+            return None
+        data = os.path.join(tmp, "verify-data")
+        sig = os.path.join(tmp, "verify-sig")
+        with open(data, "w") as f:
+            f.write(parts[0] + "." + parts[1])
+        with open(sig, "wb") as f:
+            f.write(unb64(parts[2]))
+        r = subprocess.run([real_openssl, "dgst", "-sha256", "-verify", pub, "-signature", sig,
+                            data], capture_output=True)
+        os.unlink(data)
+        os.unlink(sig)
+        if r.returncode != 0:
+            return None
+        return json.loads(unb64(parts[0])), json.loads(unb64(parts[1]))
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, code, obj):
+            body = json.dumps(obj).encode() if obj is not None else b""
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def bearer(self):
+            a = self.headers.get("Authorization", "")
+            return a[7:] if a.startswith("Bearer ") else ""
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+            jwt = self.bearer()
+            state["jwts"].append(jwt)
+            state["paths"].append(self.path)
+            if self.path != "/app/installations/%s/access_tokens" % READER_INSTALLATION:
+                return self.reply(404, {"message": "Not Found"})
+            verified = verify_jwt(jwt)
+            if verified is None or verified[1].get("iss") != READER_APP:
+                state["bad_jwt"] += 1
+                return self.reply(401, {"message": "A JSON web token could not be decoded"})
+            state["bodies"].append(body)
+            token = "ghs_reader%d_%s" % (len(state["issued"]), os.urandom(6).hex())
+            state["issued"].append(token)
+            perms = dict(body.get("permissions", {}), metadata="read")
+            repos = [{"full_name": "nifeos/" + r} for r in body.get("repositories", [])]
+            mode = state["mode"]
+            if mode == "wider":
+                perms["contents"] = "read"
+            if mode == "write":
+                perms["repository_advisories"] = "write"
+            if mode == "other-repo":
+                repos.append({"full_name": "nifeos/basalt"})
+            exp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+            self.reply(201, {"token": token, "expires_at": exp, "permissions": perms,
+                             "repositories": repos, "repository_selection": "selected"})
+
+        def do_DELETE(self):
+            if self.path == "/installation/token" and self.bearer() in state["issued"]:
+                state["revoked"].append(self.bearer())
+                return self.reply(204, None)
+            self.reply(401, {"message": "Bad credentials"})
+
+        def do_GET(self):
+            if not self.path.startswith("/installation/repositories"):
+                return self.reply(404, {"message": "Not Found"})
+            if self.bearer() not in state["issued"] or self.bearer() in state["revoked"]:
+                return self.reply(401, {"message": "Bad credentials"})
+            self.reply(200, {"total_count": len(state["repo_listing"]),
+                             "repositories": [{"full_name": n} for n in state["repo_listing"]]})
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    keep_server(server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    api = "http://127.0.0.1:%d" % server.server_address[1]
+
+    # A proxy that must never hear a request.
+    class Decoy(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def handle_one_request(self):
+            state["decoy_hits"] += 1
+            return super().handle_one_request()
+
+    decoy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Decoy)
+    keep_server(decoy)
+    threading.Thread(target=decoy.serve_forever, daemon=True).start()
+    proxy = "http://127.0.0.1:%d" % decoy.server_address[1]
+
+    base_env = {k: v for k, v in os.environ.items()
+                if "PROXY" not in k.upper() and not k.startswith("SUDO_")}
+    base_env.update({"PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": tmp})
+    stderrs = []      # every standard error, and every standard output but issue's
+    issued_out = []   # issue's standard output, which carries the token by design
+
+    def helper(*args, key_path=key, extra_env=None, stdout=subprocess.PIPE, test_flags=True):
+        full = list(args)
+        if test_flags and full[0] in ("issue", "mint", "check"):
+            if full[0] != "check" or "--fresh" in full:
+                full += ["--key", key_path, "--openssl", wrapper]
+            full += ["--api", api]
+        env = dict(base_env, **(extra_env or {}))
+        try:
+            r = subprocess.run([HELPER] + full, env=env, stdout=stdout, stderr=subprocess.PIPE,
+                               text=True, cwd=tmp, timeout=60)
+        except subprocess.TimeoutExpired:
+            check("fuzz-token %s finishes within 60 seconds" % " ".join(args), False)
+            return subprocess.CompletedProcess(full, -1, "", "timed out")
+        out = r.stdout or ""
+        if full[0] == "issue":
+            issued_out.append(out)
+        else:
+            stderrs.append(out)
+        stderrs.append(r.stderr)
+        return r
+
+    def openssl_env(lines):
+        """The names in the last openssl run's environment, less those the wrapper's own shell
+        sets."""
+        return set(lines[-1].split()) - {"PWD", "OLDPWD", "SHLVL", "_"} if lines else None
+
+    def requests():
+        return len(state["jwts"])
+
+    # 1. issue reader into a pipe.
+    r = helper("issue", "reader")
+    check("issue reader exits 0", r.returncode == 0, r.stderr)
+    check("the stub verified the JWT against the reader App", state["bad_jwt"] == 0)
+    check("the exchange goes to the reader App's installation",
+          state["paths"][-1:] == ["/app/installations/%s/access_tokens" % READER_INSTALLATION],
+          state["paths"])
+    check("the exchange asks for advisories read on nife alone", state["bodies"][-1:] == [WANTED],
+          state["bodies"])
+    claims = verify_jwt(state["jwts"][-1])[1] if state["jwts"] else {}
+    check("the JWT names App 5571868 and nothing else",
+          claims.get("iss") == READER_APP and sorted(claims) == ["exp", "iat", "iss"], claims)
+    token = state["issued"][-1] if state["issued"] else None
+    check("standard output is exactly the token and a newline", r.stdout == "%s\n" % token,
+          repr(r.stdout[:20]))
+    check("standard error names the permission, the repository and the expiry",
+          "repository_advisories:read on nifeos/nife, expires " in r.stderr, r.stderr)
+    check("standard error does not hold the token", token not in r.stderr)
+    check("the issued token was not revoked", token not in state["revoked"])
+    env_lines = open(env_log).read().splitlines() if os.path.exists(env_log) else []
+    check("openssl ran with PATH alone", openssl_env(env_lines) == {"PATH"}, env_lines[-1:])
+    tmp_counts = open(tmp_log).read().split() if os.path.exists(tmp_log) else []
+    check("issue ignores the caller's TMPDIR (its environment is cleared)",
+          tmp_counts[-1:] == ["0"], tmp_counts)
+    check("nothing but the key was written under the test directory by issue",
+          not [n for n in os.listdir(tmp) if n.endswith(".env")])
+
+    # 2. A proxy in the caller's environment reroutes nothing.
+    r = helper("issue", "reader", extra_env={"HTTP_PROXY": proxy, "http_proxy": proxy,
+                                             "HTTPS_PROXY": proxy, "ALL_PROXY": proxy})
+    check("issue with a proxy in its environment still reaches the API directly",
+          r.returncode == 0 and state["decoy_hits"] == 0, (r.stderr, state["decoy_hits"]))
+
+    # 3. Refusals before any request.
+    before = requests()
+    master, slave = pty.openpty()
+    try:
+        r = helper("issue", "reader", stdout=slave)
+    finally:
+        os.close(slave)
+        os.close(master)
+    check("issue refuses a terminal on standard output",
+          r.returncode == 3 and "standard output is a terminal" in r.stderr, r.stderr)
+    r = helper("issue", "publish")
+    check("issue refuses the publish profile", r.returncode == 3 and "never issued" in r.stderr,
+          r.stderr)
+    r = helper("issue", "filer")
+    check("issue refuses the filer profile", r.returncode == 3 and "never issued" in r.stderr,
+          r.stderr)
+    for flag, value in (("--key", key), ("--api", api), ("--openssl", wrapper)):
+        r = helper("issue", "reader", flag, value, test_flags=False,
+                   extra_env={"SUDO_UID": str(ME), "SUDO_USER": MY_NAME})
+        check("issue refuses %s under sudo" % flag,
+              r.returncode == 3 and flag in r.stderr and "under sudo" in r.stderr, r.stderr)
+    # Never run with no flags here: on a machine that holds the real key, a test run as root would
+    # mint against GitHub. Section 4 runs that path with the defaults pointed at the stub.
+    check("the reader profile reads its own App's key path by default",
+          MOD.APPS[MOD.PROFILES["reader"]["app"]]["key"] ==
+          "/etc/nife-fuzz-reader/nife-fuzz-reader.private-key.pem" and
+          MOD.PROFILES["reader"]["app"] == "nife-fuzz-reader")
+    check("no refused issue reached the API", requests() == before, requests() - before)
+
+    # 4. As sudo runs it: no flags at all, SUDO_UID set. A child process points the helper's
+    # defaults at the throwaway key and the stub, then calls its main with "issue reader" alone.
+    shim = ("import importlib.machinery, importlib.util, sys\n"
+            "l = importlib.machinery.SourceFileLoader('fuzz_token', %r)\n"
+            "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('fuzz_token', l))\n"
+            "l.exec_module(m)\n"
+            "m.APPS['nife-fuzz-reader']['key'] = %r\n"
+            "m.DEFAULT_API = %r\n"
+            "m.DEFAULT_OPENSSL = %r\n"
+            "sys.exit(m.main(['issue', 'reader']))\n" % (HELPER, key, api, wrapper))
+    r = subprocess.run([sys.executable, "-IS", "-c", shim], capture_output=True, text=True,
+                       env=dict(base_env, SUDO_UID=str(ME), SUDO_USER=MY_NAME, HTTPS_PROXY=proxy,
+                                SSL_CERT_FILE="/nonexistent"), timeout=60)
+    issued_out.append(r.stdout)
+    stderrs.append(r.stderr)
+    check("issue reader, exactly as the sudo rule names it, issues a token",
+          r.returncode == 0 and state["issued"] and r.stdout == state["issued"][-1] + "\n",
+          r.stderr)
+    check("the token's line names the sudo caller", ("to %s:" % MY_NAME) in r.stderr, r.stderr)
+    env_lines = open(env_log).read().splitlines() if os.path.exists(env_log) else []
+    check("under sudo, openssl again ran with PATH alone", openssl_env(env_lines) == {"PATH"},
+          env_lines[-1:])
+
+    # 5. Answers that must be refused, revoked, and never printed.
+    for mode, word in (("wider", "contents"), ("write", "repository_advisories:write"),
+                       ("other-repo", "nifeos/basalt")):
+        state["mode"] = mode
+        n = len(state["issued"])
+        r = helper("issue", "reader")
+        check("an answer that is %s is refused" % mode, r.returncode == 3 and word in r.stderr,
+              r.stderr)
+        check("the %s token is revoked" % mode, len(state["issued"]) > n and
+              state["issued"][-1] in state["revoked"], state["revoked"][-1:])
+        check("the %s token never reaches standard output" % mode, r.stdout == "", r.stdout)
+    state["mode"] = "ok"
+
+    # 6. A pipe nobody reads: the token is revoked.
+    rfd, wfd = os.pipe()
+    os.close(rfd)
+    n = len(state["issued"])
+    try:
+        r = helper("issue", "reader", stdout=wfd)
+    finally:
+        os.close(wfd)
+    check("a token that cannot be written is refused and revoked",
+          r.returncode == 3 and "revoked it" in r.stderr and len(state["issued"]) > n and
+          state["issued"][-1] in state["revoked"], r.stderr)
+
+    # 7. The reader key.
+    before = requests()
+    r = helper("issue", "reader", key_path=os.path.join(keydir, "missing.pem"))
+    check("a missing reader key is refused", r.returncode == 3 and "cannot be opened" in r.stderr,
+          r.stderr)
+    for mode in (0o440, 0o444, 0o600):
+        os.chmod(key, mode)
+        r = helper("issue", "reader")
+        check("a reader key with mode %04o is refused" % mode,
+              r.returncode == 3 and "%04o" % mode in r.stderr, r.stderr)
+    os.chmod(key, 0o400)
+    os.chmod(keydir, 0o750)
+    r = helper("issue", "reader")
+    check("a reader key directory with mode 0750 is refused",
+          r.returncode == 3 and "0750" in r.stderr, r.stderr)
+    os.chmod(keydir, 0o700)
+    link = os.path.join(keydir, "link.pem")
+    os.symlink(key, link)
+    r = helper("issue", "reader", key_path=link)
+    check("a reader key reached through a link is refused",
+          r.returncode == 3 and "link" in r.stderr, r.stderr)
+    os.unlink(link)
+    ok_, msg = refused(MOD.check_key, key, ME + 1)
+    check("a reader key owned by another account is refused", ok_ and "uid %d" % (ME + 1) in msg,
+          msg)
+    real_listxattr = os.listxattr
+    for where in ("file", "directory"):
+        want_mode = 0o400 if where == "file" else 0o700
+
+        def listxattr(path, *a, **kw):
+            if isinstance(path, int) and \
+                    (os.fstat(path).st_mode & 0o7777) == want_mode and \
+                    (os.fstat(path).st_mode & 0o170000) == (0o100000 if where == "file"
+                                                             else 0o040000):
+                return ["system.posix_acl_access"]
+            return real_listxattr(path, *a, **kw)
+        os.listxattr = listxattr
+        try:
+            ok_, msg = refused(MOD.check_key, key, ME)
+        finally:
+            os.listxattr = real_listxattr
+        check("a POSIX ACL on the key %s is refused" % where,
+              ok_ and "ACL" in msg and ("key file" if where == "file" else "key directory") in msg,
+              msg)
+    ok_, got = refused(MOD.check_key, key, ME)
+    check("the same key without an ACL is read", not ok_ and got.startswith(b"-----BEGIN"))
+    check("no refused key reached the API", requests() == before, requests() - before)
+
+    # 8. check reader --fresh.
+    n_rev = len(state["revoked"])
+    r = helper("check", "reader", "--fresh")
+    check("check reader --fresh exits 0", r.returncode == 0, r.stdout + r.stderr)
+    check("check prints the granted permissions exactly",
+          "permissions: metadata:read,repository_advisories:read\n" in r.stdout, r.stdout)
+    check("check prints exactly nifeos/nife", "repositories: nifeos/nife\n" in r.stdout, r.stdout)
+    check("check names the reader App and installation",
+          "app: nife-fuzz-reader (App ID 5571868, installation 177642435)" in r.stdout, r.stdout)
+    check("check prints the expiry", "expires: " in r.stdout, r.stdout)
+    check("check revokes its token", len(state["revoked"]) == n_rev + 1 and
+          state["revoked"][-1] == state["issued"][-1] and "revoked: yes" in r.stdout, r.stdout)
+    check("check never prints its token", state["issued"][-1] not in r.stdout + r.stderr)
+    state["repo_listing"] = ["nifeos/nife", "nifeos/basalt"]
+    r = helper("check", "reader", "--fresh")
+    check("check fails when the token reaches a second repository",
+          r.returncode == 1 and "nifeos/nife alone" in r.stderr and
+          state["issued"][-1] in state["revoked"], r.stdout + r.stderr)
+    state["repo_listing"] = ["nifeos/nife"]
+    state["mode"] = "write"
+    r = helper("check", "reader", "--fresh")
+    check("check refuses a token granted write", r.returncode == 3 and "write" in r.stderr,
+          r.stderr)
+    state["mode"] = "ok"
+    r = helper("check", "reader", "--key", key, test_flags=False)
+    check("check without --fresh refuses --key", r.returncode == 3 and "--fresh" in r.stderr,
+          r.stderr)
+
+    # 9. mint reader: the file route.
+    out = os.path.join(tmp, "run-fuzz-token")
+    r = helper("mint", "reader", "--out-dir", out)
+    check("mint reader without --reader is refused",
+          r.returncode == 3 and "no default reader" in r.stderr, r.stderr)
+    r = helper("mint", "reader", "--out-dir", out, "--reader", MY_NAME, "--group", MY_GROUP)
+    check("mint reader with a named reader writes the token file", r.returncode == 0 and
+          os.path.exists(os.path.join(out, "reader.env")), r.stderr)
+    tmp_counts = open(tmp_log).read().split() if os.path.exists(tmp_log) else []
+    check("mint, whose environment the unit sets, uses TMPDIR (the control for the issue check)",
+          tmp_counts[-1:] == ["1"], tmp_counts)
+    if os.path.exists(os.path.join(out, "reader.env")):
+        with open(os.path.join(out, "reader.env")) as f:
+            body = f.read()
+        check("the file records advisories read on nifeos/nife",
+              "GH_TOKEN_PERMISSIONS=repository_advisories:read\n" in body and
+              "GH_TOKEN_REPOSITORIES=nifeos/nife\n" in body)
+    r = helper("profiles", test_flags=False)
+    check("profiles lists reader with its App and no default reader",
+          "reader\tnife-fuzz-reader\trepository_advisories:read\treader (none)" in r.stdout,
+          r.stdout)
+
+    # 10. Nothing holds a secret where it should not.
+    secrets = state["issued"] + [j for j in state["jwts"] if j]
+    text = "\n".join(stderrs)
+    check("no standard error, and no output but issue's, holds a token or a JWT",
+          not any(s in text for s in secrets))
+    check("no output holds a line of the key",
+          not any(l in text + "\n".join(issued_out) for l in key_lines))
+    check("issue's standard output never held a JWT",
+          not any(j in "\n".join(issued_out) for j in state["jwts"] if j))
+    argv_text = open(argv_log).read() if os.path.exists(argv_log) else ""
+    check("no argument list holds the key, a token or a JWT",
+          argv_text and not any(s in argv_text for s in secrets + key_lines))
+    allowed = {os.path.realpath(key), os.path.realpath(os.path.join(out, "reader.env"))}
+    for dirpath, _, names in os.walk(tmp):
+        for name in names:
+            p = os.path.realpath(os.path.join(dirpath, name))
+            if p in allowed or not os.path.isfile(p):
+                continue
+            with open(p, "rb") as f:
+                data = f.read().decode(errors="replace")
+            check("%s holds no secret" % os.path.relpath(p, tmp),
+                  not any(s in data for s in secrets + key_lines))
+
+    if failures:
+        print("fuzz-token-reader-selftest: %d failed" % len(failures), file=sys.stderr)
+        return 1
+    print("fuzz-token-reader-selftest: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
