@@ -42,8 +42,8 @@ else is refused before the file is read. On the host that user is root.
 
 `--reader` and `--group` exist for a drop-in that gives a profile its own account. `--key`,
 `--out-dir`, `--api` and `--openssl` exist for the selftest; the installed unit passes none of them.
-`--api` refuses any address that is not https, except a loopback one, and the helper refuses every
-HTTP redirect.
+`--api` accepts https://api.github.com and plain http to a literal loopback address and nothing
+else, and the helper refuses every HTTP redirect.
 
 Name: provisional, as are the profile names and the paths. docs/fuzz-token.md has the install
 steps for a person with root.
@@ -108,6 +108,10 @@ KEY_MODE = 0o400
 KEY_DIR_MODE = 0o700
 OUT_DIR_MODE = 0o711
 TOKEN_MODE = 0o440
+# The token file's owner, whoever runs `check`. The selftest, which cannot make root's files,
+# changes it in process.
+TOKEN_OWNER_UID = 0
+ACL_XATTRS = ("system.posix_acl_access", "system.posix_acl_default")
 
 # Every secret this process has seen; refusal messages pass through redact() before printing.
 SECRETS = []
@@ -219,18 +223,27 @@ OPENER = urllib.request.build_opener(NoRedirect)
 
 
 def check_api(api):
-    """The API base, refused unless it is https, or http to a loopback address (the selftest)."""
-    u = urllib.parse.urlsplit(api)
-    host = u.hostname or ""
-    if u.scheme == "https" and host:
+    """The API base, refused unless it is exactly https://api.github.com, or plain http to a literal
+    loopback address (127.0.0.0/8 or ::1, the selftest's stub). No user information, path, query or
+    IPv4-mapped address is accepted, and no name but api.github.com is looked up."""
+    try:
+        u = urllib.parse.urlsplit(api)
+        port = u.port
+    except ValueError:
+        raise Refusal("the API address %s does not parse" % api)
+    bare = not (u.username or u.password or u.query or u.fragment or u.path not in ("", "/"))
+    if bare and u.scheme == "https" and u.hostname == "api.github.com" and port in (None, 443):
         return api
-    if u.scheme == "http":
+    if bare and u.scheme == "http" and u.hostname:
         try:
-            if host == "localhost" or ipaddress.ip_address(host).is_loopback:
-                return api
+            ip = ipaddress.ip_address(u.hostname)
         except ValueError:
-            pass
-    raise Refusal("the API address %s is neither https nor loopback" % api)
+            ip = None
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if ip is not None and mapped is None and ip.is_loopback:
+            return api
+    raise Refusal("the API address %s is neither https://api.github.com nor plain http to a "
+                  "loopback address" % api)
 
 
 def call(api, method, path, bearer, body=None):
@@ -337,17 +350,49 @@ def prepare_out_dir(out_dir, uid):
         raise Refusal("the token directory %s must be a directory owned by uid %d, mode %04o; it "
                       "is owned by uid %d with mode %s" % (out_dir, uid, OUT_DIR_MODE, st.st_uid,
                                                           mode_text(st)))
+    acl = posix_acls(out_dir)
+    if acl:
+        raise Refusal("the token directory %s carries a POSIX ACL (%s), which could let another "
+                      "account read the token; remove it with setfacl -b -k" % (out_dir,
+                                                                               ", ".join(acl)))
+
+
+def posix_acls(path):
+    """The POSIX ACL attributes on `path`, not following a link. A file system without extended
+    attributes has none."""
+    try:
+        names = os.listxattr(path, follow_symlinks=False)
+    except OSError:
+        return []
+    return sorted(n for n in names if n in ACL_XATTRS)
 
 
 def reader_group(group_name, reader):
     """The group the token file belongs to, after checking that `reader` is in it and that no
-    other account is, as a listed member or by its primary group."""
+    other account is.
+
+    The gid must map back to `group_name`, and every group entry that shares the gid counts: its
+    listed members, and every account whose primary group it is. docs/fuzz-token.md lists what this
+    cannot see."""
     try:
         g = grp.getgrnam(group_name)
     except KeyError:
         raise Refusal("no group named %s on this host; docs/fuzz-token.md says how to make it"
                       % group_name)
-    members = set(g.gr_mem) | {p.pw_name for p in pwd.getpwall() if p.pw_gid == g.gr_gid}
+    try:
+        canonical = grp.getgrgid(g.gr_gid).gr_name
+    except KeyError:
+        canonical = None
+    if canonical != group_name:
+        raise Refusal("the group %s has gid %d, which maps back to %s; the token's group must be "
+                      "the only name for its gid" % (group_name, g.gr_gid, canonical))
+    sharing = [e for e in grp.getgrall() if e.gr_gid == g.gr_gid]
+    names = sorted({e.gr_name for e in sharing} - {group_name})
+    if names:
+        raise Refusal("the groups %s share gid %d with %s; the token's group must be the only "
+                      "name for its gid" % (", ".join(names), g.gr_gid, group_name))
+    members = set(g.gr_mem) | {m for e in sharing for m in e.gr_mem} | \
+        {p.pw_name for p in pwd.getpwall() if p.pw_gid == g.gr_gid}
     if reader.pw_name not in members:
         raise Refusal("the account %s is not in the group %s" % (reader.pw_name, group_name))
     others = sorted(members - {reader.pw_name})
@@ -390,12 +435,16 @@ def write_token(out_dir, profile, reader, group, token, expires):
 
 def read_token_file(path):
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY |
+                     os.O_NONBLOCK)
     except OSError as e:
-        raise Refusal("the token file %s cannot be opened: %s" % (path, e.strerror))
+        raise Refusal("the token file %s cannot be opened: %s (a link is refused)"
+                      % (path, e.strerror))
     try:
         st = os.fstat(fd)
-        text = os.read(fd, 65536).decode()
+        if not stat.S_ISREG(st.st_mode):
+            raise Refusal("the token file %s is not a regular file" % path)
+        text = os.read(fd, 65536).decode(errors="replace")
     finally:
         os.close(fd)
     fields = {}
@@ -417,11 +466,41 @@ def reader_account(name):
         raise Refusal("no account named %s on this host" % name)
 
 
+def discard_stale(api, out_dir, profile):
+    """Remove the profile's token file and revoke the token in it, after the reader or its group
+    stopped passing, so a file made for the old group does not stay readable. Says what it did."""
+    path = os.path.join(out_dir, profile + ".env")
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "no earlier token file to remove"
+    except OSError as e:
+        return "could not inspect %s: %s" % (path, e.strerror)
+    token = None
+    if stat.S_ISREG(st.st_mode):
+        try:
+            token = read_token_file(path)[1]["GH_TOKEN"]
+        except Refusal:
+            token = None
+    try:
+        os.unlink(path)
+    except OSError as e:
+        return "could not remove %s: %s" % (path, e.strerror)
+    if token is None:
+        return "removed %s, which held no readable token" % path
+    if TOKEN_SHAPE.fullmatch(token) and revoke(api, token):
+        return "removed %s and revoked its token" % path
+    return "removed %s; could not revoke its token, so it lapses within the hour" % path
+
+
 def mint(args):
     profile = args.profile
     api = check_api(args.api)
-    reader = reader_account(args.reader or PROFILES[profile]["reader"])
-    group = reader_group(args.group or "fuzz-token-" + profile, reader)
+    try:
+        reader = reader_account(args.reader or PROFILES[profile]["reader"])
+        group = reader_group(args.group or "fuzz-token-" + profile, reader)
+    except Refusal as e:
+        raise Refusal("%s; %s" % (e, discard_stale(api, args.out_dir, profile)))
     uid = os.geteuid()
     key = check_key(args.key, uid)
     prepare_out_dir(args.out_dir, uid)
@@ -458,16 +537,24 @@ def check(args):
     print("permissions: %s" % fields.get("GH_TOKEN_PERMISSIONS", "unrecorded"))
     print("expires: %s (%s)" % (fields["GH_TOKEN_EXPIRES_AT"],
                                 "in %d minutes" % (left // 60) if left > 0 else "expired"))
+    acl = posix_acls(path)
     print("repositories: %s" % (" ".join(names) or "none"))
+    if acl:
+        print("acl: %s" % ", ".join(acl))
     problems = []
+    want_group = args.group or "fuzz-token-" + args.profile
+    if group != want_group:
+        problems.append("the file's group must be %s" % want_group)
+    if acl:
+        problems.append("the file must carry no POSIX ACL")
     if names != [FULL_NAME]:
         problems.append("the token must reach %s alone" % FULL_NAME)
     if left <= 0:
         problems.append("the token has expired; is fuzz-token@%s.timer running?" % args.profile)
     if stat.S_IMODE(st.st_mode) != TOKEN_MODE:
         problems.append("the file's mode must be %04o" % TOKEN_MODE)
-    if st.st_uid != os.geteuid() and os.geteuid() == 0:
-        problems.append("the file must be owned by root")
+    if st.st_uid != TOKEN_OWNER_UID:
+        problems.append("the file must be owned by uid %d (root)" % TOKEN_OWNER_UID)
     for p in problems:
         print("fuzz-token: %s" % p, file=sys.stderr)
     return 1 if problems else 0
@@ -495,6 +582,7 @@ def main(argv):
     m.set_defaults(run=mint)
     c = sub.add_parser("check", help="print the token's repositories and expiry, never the token")
     c.add_argument("profile", choices=sorted(PROFILES))
+    c.add_argument("--group", help="the group the file must have, if not fuzz-token-PROFILE")
     c.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     c.add_argument("--api", default=DEFAULT_API)
     c.set_defaults(run=check)

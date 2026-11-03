@@ -35,7 +35,10 @@ GH_TOKEN_REPOSITORIES=nifeos/nife
 ```
 
 The group must hold the reader and no other account, as a listed member or as anyone's primary
-group, or the helper refuses. The reader can read the file and can neither change its mode nor
+group, under its own name or any other group entry that shares its gid, and its gid must map back to
+its name, or the helper refuses. When the reader or its group stops passing, the helper removes the
+profile's existing token file and revokes the token in it, so a file made for the old group does
+not stay readable. The token directory must carry no POSIX ACL. The reader can read the file and can neither change its mode nor
 rewrite it, and the directory is root's, so a file systemd parses as root stays root's. A shell can
 source it, and systemd's `EnvironmentFile=` reads it as root before the service drops to its own
 user, so `gh` in the service finds `GH_TOKEN` in its environment. `fuzz-token@<profile>.timer`
@@ -52,8 +55,9 @@ mints a fresh token every 20 minutes, so the file always holds one with at least
   but 0400, and a key directory that is a link or is not owned by root with mode 0700, before it
   reads a byte.
 - It refuses a token GitHub grants wider or narrower than asked, for another repository, without an
-  expiry, or of an unexpected shape, and revokes it. It refuses every HTTP redirect, and any API
-  address that is not https.
+  expiry, or of an unexpected shape, and revokes it. It refuses every HTTP redirect. It talks to
+  `https://api.github.com` and nothing else, except plain http to a literal loopback address, which
+  exists for the selftest's stub.
 - It runs `/usr/bin/openssl` with `PATH=/usr/bin:/bin` and nothing else in its environment, and
   Python with `-IS`, so neither the caller's environment nor site packages reach it.
 - It runs from a root-owned copy outside any clone. The host's update from nife's main never
@@ -88,7 +92,9 @@ Verify. After each command, the text after the colon is its expected output:
 - `sudo stat -c '%U %G %a' /run/fuzz-token /run/fuzz-token/publish.env`: `root root 711`, then
   `root fuzz-token-publish 440`.
 - `sudo /usr/local/sbin/fuzz-token check publish`: a `repositories: nifeos/nife` line, an
-  `expires:` line about an hour ahead, and exit status 0. It never prints the token.
+  `expires:` line about an hour ahead, and exit status 0. It never prints the token. It fails
+  unless the file is a regular file owned by root, with the group `fuzz-token-publish`, mode 0440
+  and no POSIX ACL, and prints an `acl:` line when it finds one.
 - `systemctl list-timers 'fuzz-token@*'`: the next run within 20 minutes.
 
 If `check` lists any repository besides nifeos/nife, `mint` would already have refused it, so the
@@ -158,3 +164,13 @@ hour. Suspending the App's installation stops every token at once.
 - Both profiles default to the reader `lane`, so until a profile gets its own account the split
   isolates nothing between profiles (see above).
 - A token already minted stays valid for up to an hour after its reader no longer needs it.
+- The group check reads the group and account databases through NSS, and some ways into a group
+  never appear there. It cannot see:
+  - members of a directory service (LDAP, SSSD) whose enumeration is switched off, so
+    `getgrall` and `getpwall` do not list them;
+  - a systemd unit whose `Group=` or `SupplementaryGroups=` grants the gid, which needs no
+    `/etc/group` entry at all;
+  - a password on the group in `/etc/gshadow`, which lets anyone who knows it join with `newgrp`.
+
+  On the fuzz host, keep the groups local, give no unit but the reader's the token's group, and
+  leave the group's gshadow password field as `!`.

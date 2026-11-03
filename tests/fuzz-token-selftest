@@ -18,7 +18,8 @@ it still exists, before running the real binary. It checks:
   link;
 - that the token's group must hold the reader and no one else;
 - that an answer that grants more, grants less, reaches another repository, lacks the repository
-  list or the expiry, carries a token of the wrong shape, or redirects, is refused and not written;
+  list or the expiry, carries a token of the wrong shape, or redirects (to a second listener that
+  must hear nothing), is refused and not written;
   that a refused token is revoked, and that a failed revocation says so;
 - that an API address other than https or loopback is refused;
 - that `check` prints the repositories and the expiry, never the token, and fails on a stale token or
@@ -31,6 +32,8 @@ Name: provisional.
 """
 
 import base64
+import contextlib
+import io
 import grp
 import http.server
 import importlib.machinery
@@ -141,7 +144,8 @@ def run(tmp, keep_server):
     os.chmod(wrapper, 0o755)
 
     state = {"mode": "ok", "bodies": [], "jwts": [], "issued": [], "revoked": [],
-             "bad_jwt": 0, "expired_jwt": 0, "delete_fails": False,
+             "bad_jwt": 0, "expired_jwt": 0, "delete_fails": False, "decoy_hits": 0,
+             "get_redirect": False,
              "repo_listing": ["nifeos/nife"]}
 
     def verify_jwt(jwt):
@@ -192,8 +196,8 @@ def run(tmp, keep_server):
                 # An answer that echoes the credential back, as a careless proxy might.
                 return self.reply(401, {"message": "bad credentials: " + jwt})
             if mode == "redirect":
-                return self.reply(307, {"message": "moved"},
-                                  [("Location", "http://127.0.0.1:9/elsewhere")])
+                return self.reply(302, {"message": "moved"},
+                                  [("Location", state["decoy"] + self.path)])
             verified = verify_jwt(jwt)
             if verified is None:
                 state["bad_jwt"] += 1
@@ -235,6 +239,9 @@ def run(tmp, keep_server):
         def do_GET(self):
             if not self.path.startswith("/installation/repositories"):
                 return self.reply(404, {"message": "Not Found"})
+            if state["get_redirect"]:
+                return self.reply(302, {"message": "moved"},
+                                  [("Location", state["decoy"] + self.path)])
             if self.bearer() not in state["issued"]:
                 return self.reply(401, {"message": "Bad credentials"})
             self.reply(200, {"total_count": len(state["repo_listing"]),
@@ -245,6 +252,29 @@ def run(tmp, keep_server):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     api = "http://127.0.0.1:%d" % server.server_address[1]
 
+    # A second listener, the target of every redirect. It must never hear a request.
+    class Decoy(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def handle_one_request(self):
+            state["decoy_hits"] += 1
+            return super().handle_one_request()
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = do_DELETE = do_GET
+
+    decoy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Decoy)
+    keep_server(decoy)
+    threading.Thread(target=decoy.serve_forever, daemon=True).start()
+    state["decoy"] = "http://127.0.0.1:%d" % decoy.server_address[1]
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1"
+    for k in [k for k in os.environ if k.upper().endswith("_PROXY") and k.upper() != "NO_PROXY"]:
+        del os.environ[k]
+
     out = os.path.join(tmp, "run-fuzz-token")
     env = {k: v for k, v in os.environ.items() if "PROXY" not in k.upper()}
     env.update({"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1",
@@ -254,16 +284,57 @@ def run(tmp, keep_server):
     def helper(*args, key_path=key, out_dir=out):
         full = list(args)
         if full[0] == "mint":
-            full += ["--reader", MY_NAME, "--group", MY_GROUP, "--key", key_path,
-                     "--openssl", wrapper]
+            full += ["--reader", MY_NAME, "--key", key_path, "--openssl", wrapper]
+            if "--group" not in full:
+                full += ["--group", MY_GROUP]
+        if full[0] == "check" and "--group" not in full:
+            full += ["--group", MY_GROUP]
         if full[0] in ("mint", "check"):
             full += ["--out-dir", out_dir]
             if "--api" not in full:
                 full += ["--api", api]
-        r = subprocess.run([sys.executable, "-I", "-S", HELPER] + full, env=env,
-                           capture_output=True, text=True, cwd=tmp)
+        # Run as installed: through its own shebang (python3 -IS) and its executable bit.
+        # A hang (a blocking open) or a helper that cannot be run is a failure, not a crash.
+        try:
+            r = subprocess.run([HELPER] + full, env=env, capture_output=True, text=True, cwd=tmp,
+                               timeout=60)
+        except subprocess.TimeoutExpired:
+            check("fuzz-token %s finishes within 60 seconds" % " ".join(args), False)
+            r = subprocess.CompletedProcess(full, -1, "", "timed out")
+        except OSError as e:
+            check("fuzz-token can be run directly", False, e)
+            r = subprocess.CompletedProcess(full, -1, "", str(e))
         outputs.append(r.stdout + r.stderr)
         return r
+
+    def check_in_process(*args, listxattr=None):
+        """`check`, run in this process with the expected owner set to this test's uid, because a
+        test cannot make root's files. (exit status, standard output, standard error)"""
+        full = ["check"] + list(args)
+        if "--group" not in full:
+            full += ["--group", MY_GROUP]
+        full += ["--out-dir", out, "--api", api]
+        o, e = io.StringIO(), io.StringIO()
+        saved_owner, saved_listxattr = MOD.TOKEN_OWNER_UID, os.listxattr
+        MOD.TOKEN_OWNER_UID = ME
+        if listxattr:
+            os.listxattr = listxattr
+        try:
+            with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+                rc = MOD.main(full)
+        finally:
+            MOD.TOKEN_OWNER_UID, os.listxattr = saved_owner, saved_listxattr
+        outputs.append(o.getvalue() + e.getvalue())
+        return rc, o.getvalue(), e.getvalue()
+
+    def fake_acl(target):
+        real = os.listxattr
+
+        def listxattr(path, *a, **kw):
+            if os.path.realpath(path) == os.path.realpath(target):
+                return ["user.something", "system.posix_acl_access"]
+            return real(path, *a, **kw)
+        return listxattr
 
     def token_file(profile):
         return os.path.join(out, profile + ".env")
@@ -373,14 +444,30 @@ def run(tmp, keep_server):
           len(rep) == 1 and rep[0][1] == path and names.index("replace") > first_write, names)
 
     # 4. check.
+    check("the helper is executable and starts with python3 -IS",
+          os.access(HELPER, os.X_OK) and open(HELPER).readline() == "#!/usr/bin/python3 -IS\n")
+    rc, o, e = check_in_process("publish")
+    check("check exits 0 on a fresh token", rc == 0, o + e)
+    check("check prints exactly nifeos/nife", "repositories: nifeos/nife\n" in o, o)
+    check("check prints the expiry", "expires: " in o and "minutes" in o, o)
     r = helper("check", "publish")
-    check("check exits 0 on a fresh token", r.returncode == 0, r.stdout + r.stderr)
-    check("check prints exactly nifeos/nife", "repositories: nifeos/nife\n" in r.stdout, r.stdout)
-    check("check prints the expiry", "expires: " in r.stdout and "minutes" in r.stdout, r.stdout)
+    check("check, run directly, refuses a token file not owned by root",
+          r.returncode == 1 and "owned by uid 0" in r.stderr, r.stdout + r.stderr)
+    rc, o, e = check_in_process("publish", "--group", "fuzz-token-publish")
+    check("check fails on a file with another group",
+          rc == 1 and "group must be fuzz-token-publish" in e, o + e)
+    rc, o, e = check_in_process("publish", listxattr=fake_acl(token_file("publish")))
+    check("check reports and fails on an ACL on the token file",
+          rc == 1 and "acl: system.posix_acl_access" in o and "ACL" in e, o + e)
     state["repo_listing"] = ["nifeos/nife", "nifeos/basalt"]
-    r = helper("check", "publish")
-    check("check fails when the token reaches a second repository", r.returncode == 1, r.stdout)
+    rc, o, e = check_in_process("publish")
+    check("check fails when the token reaches a second repository", rc == 1, o)
     state["repo_listing"] = ["nifeos/nife"]
+    state["get_redirect"] = True
+    rc, o, e = check_in_process("publish")
+    check("check refuses a redirect from the repository listing",
+          rc == 3 and "redirect" in e and state["decoy_hits"] == 0, (o + e, state["decoy_hits"]))
+    state["get_redirect"] = False
     stale = token_file("filer")
     body = open(stale).read()
     os.chmod(stale, 0o640)
@@ -389,9 +476,14 @@ def run(tmp, keep_server):
                           else "GH_TOKEN_EXPIRES_AT=2026-01-01T00:00:00Z"
                           for l in body.splitlines()) + "\n")
     os.chmod(stale, 0o440)
-    r = helper("check", "filer")
-    check("check fails on an expired token", r.returncode == 1 and "expired" in r.stdout + r.stderr,
-          r.stdout + r.stderr)
+    rc, o, e = check_in_process("filer")
+    check("check fails on an expired token", rc == 1 and "expired" in o + e, o + e)
+    fifo_out = os.path.join(tmp, "fifo-out")
+    os.mkdir(fifo_out, 0o711)
+    os.mkfifo(os.path.join(fifo_out, "publish.env"), 0o440)
+    r = helper("check", "publish", out_dir=fifo_out)
+    check("check refuses a FIFO in place of the token file without blocking",
+          r.returncode == 3 and "regular file" in r.stderr, r.stderr)
 
     # 5. Refusals before any request: the key.
     requests_before = len(state["jwts"])
@@ -443,25 +535,42 @@ def run(tmp, keep_server):
     r = helper("mint", "publish", out_dir=out_link)
     check("a token directory reached through a link is refused",
           r.returncode == 3 and "token directory" in r.stderr, r.stderr)
+    saved = os.listxattr
+    os.listxattr = fake_acl(out)
+    try:
+        ok_, msg = refused(MOD.prepare_out_dir, out, ME)
+    finally:
+        os.listxattr = saved
+    check("a token directory carrying a POSIX ACL is refused", ok_ and "ACL" in msg, msg)
+    ok_, _ = refused(MOD.prepare_out_dir, out, ME)
+    check("the same directory without the ACL is accepted", not ok_)
     check("no refused key or directory reached the API", len(state["jwts"]) == requests_before,
           len(state["jwts"]) - requests_before)
 
     # 7. The token's group must hold the reader alone.
-    real_getgrnam, real_getpwall = MOD.grp.getgrnam, MOD.pwd.getpwall
+    real_grp = (MOD.grp.getgrnam, MOD.grp.getgrgid, MOD.grp.getgrall)
+    real_getpwall = MOD.pwd.getpwall
     fake_users = [pwd.struct_passwd(("reader", "x", 5001, 5001, "", "/", "/bin/false")),
                   pwd.struct_passwd(("other", "x", 5002, 5002, "", "/", "/bin/false"))]
 
-    def with_group(members, gid, primary_other=False):
+    def with_group(members, gid, primary_other=False, alias=None, alias_first=False):
         g = grp.struct_group(("fuzz-token-publish", "x", gid, members))
+        entries = [g]
+        if alias:
+            a = grp.struct_group((alias[0], "x", alias[2] if len(alias) > 2 else gid, alias[1]))
+            entries = [a, g] if alias_first else [g, a]
         users = list(fake_users)
         if primary_other:
             users.append(pwd.struct_passwd(("sneaky", "x", 5003, gid, "", "/", "/bin/false")))
-        MOD.grp.getgrnam = lambda name: g
+        MOD.grp.getgrnam = lambda name: next(e for e in entries if e.gr_name == name)
+        MOD.grp.getgrgid = lambda n: next(e for e in entries if e.gr_gid == n)
+        MOD.grp.getgrall = lambda: list(entries)
         MOD.pwd.getpwall = lambda: users
         try:
             return refused(MOD.reader_group, "fuzz-token-publish", fake_users[0])
         finally:
-            MOD.grp.getgrnam, MOD.pwd.getpwall = real_getgrnam, real_getpwall
+            MOD.grp.getgrnam, MOD.grp.getgrgid, MOD.grp.getgrall = real_grp
+            MOD.pwd.getpwall = real_getpwall
 
     ok_, _ = with_group(["reader"], 6000)
     check("a group that holds the reader alone is accepted", not ok_)
@@ -474,17 +583,49 @@ def run(tmp, keep_server):
           ok_ and "sneaky" in msg, msg)
     ok_, _ = with_group([], 5001)
     check("the reader's own primary group, alone, is accepted", not ok_)
+    ok_, msg = with_group(["reader"], 6000, alias=("backdoor", ["other"]))
+    check("a second group entry with the same gid is refused", ok_ and "backdoor" in msg, msg)
+    ok_, msg = with_group(["reader"], 6000, alias=("fuzz-token-publish", ["other"]))
+    check("a second entry of the same name and gid adds its members",
+          ok_ and "other" in msg, msg)
+    ok_, msg = with_group(["reader"], 6000, alias=("backdoor", []), alias_first=True)
+    check("a gid that maps back to another name is refused", ok_ and "maps back" in msg, msg)
+
+    # The reader or its group stops passing: the old token file goes, and its token is revoked.
+    r = helper("mint", "publish")
+    old_token = fields("publish")["GH_TOKEN"] if r.returncode == 0 else None
+    r = helper("mint", "publish", "--group", "fuzz-token-no-such-group")
+    check("a missing group is refused", r.returncode == 3 and "no group named" in r.stderr,
+          r.stderr)
+    check("the refusal removes the earlier token file", not os.path.exists(token_file("publish"))
+          and "removed" in r.stderr, r.stderr)
+    check("the refusal revokes the earlier token",
+          old_token is not None and old_token in state["revoked"] and "revoked its token" in
+          r.stderr, r.stderr)
 
     # 8. API addresses.
-    for a, good in (("https://api.github.com", True), ("http://127.0.0.1:1", True),
-                    ("http://[::1]:1", True), ("http://localhost:1", True),
-                    ("http://api.github.com", False), ("http://10.0.0.1", False),
-                    ("ftp://api.github.com", False), ("api.github.com", False)):
+    for a, good in (("https://api.github.com", True), ("https://api.github.com/", True),
+                    ("https://api.github.com:443", True),
+                    ("http://127.0.0.1:1", True), ("http://127.0.0.2:1", True),
+                    ("http://[::1]:1", True),
+                    ("http://localhost:1", False), ("http://api.github.com", False),
+                    ("http://10.0.0.1", False), ("ftp://api.github.com", False),
+                    ("api.github.com", False), ("https://example.com", False),
+                    ("https://api.github.com.example.com", False),
+                    ("https://api.github.com:8443", False), ("https://api.github.com/x", False),
+                    ("https://user@api.github.com", False),
+                    ("https://user:pw@api.github.com", False),
+                    ("http://user:pw@127.0.0.1:1", False),
+                    ("http://[::ffff:127.0.0.1]:1", False),
+                    ("http://127.0.0.1:1/?q=1", False)):
         ok_, _ = refused(MOD.check_api, a)
         check("the API address %s is %s" % (a, "accepted" if good else "refused"), ok_ != good)
     r = helper("mint", "publish", "--api", "http://example.com")
     check("mint refuses a plain-http API before any request",
-          r.returncode == 3 and "neither https nor loopback" in r.stderr, r.stderr)
+          r.returncode == 3 and "neither https://api.github.com nor" in r.stderr, r.stderr)
+    r = helper("mint", "publish", "--api", "https://example.com")
+    check("mint refuses an https host that is not GitHub's",
+          r.returncode == 3 and "neither https://api.github.com nor" in r.stderr, r.stderr)
 
     # 9. An expired JWT, signed in process, is refused by the stub, and the helper says so.
     ok_, msg = refused(MOD.exchange, api,
@@ -514,6 +655,7 @@ def run(tmp, keep_server):
                   len(state["issued"]) > issued_before and state["issued"][-1] in state["revoked"]
                   and "revoked it" in r.stderr, r.stderr)
         check("the %s token is not written" % mode, not os.path.exists(token_file("publish")))
+    check("no redirect reached the second listener", state["decoy_hits"] == 0, state["decoy_hits"])
     state["mode"] = "wider"
     state["delete_fails"] = True
     r = helper("mint", "publish")
