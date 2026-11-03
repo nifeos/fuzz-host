@@ -1,0 +1,13 @@
+# Start fuzz-filer.service 5 minutes after boot and every 30 minutes after that. A held finding is
+# filed within about half an hour, well inside the 3-day triage clock, and an idle run sends nothing.
+# Name: provisional.
+[Unit]
+Description=File held fuzz findings every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

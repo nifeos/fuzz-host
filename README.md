@@ -15,7 +15,8 @@ The maintainers keep the host's own specification (its name, address and hardwar
 | path | what |
 |---|---|
 | `bin/fuzz-token` | mints one narrowed one-hour installation token of the fuzz host's GitHub App per service, from the App's root-only key ([docs/fuzz-token.md](docs/fuzz-token.md), with the install steps) |
-| `systemd/` | `fuzz-token@.service` and `fuzz-token@.timer`, one instance per service |
+| `bin/fuzz-filer` | files one private security advisory on nifeos/nife per held fuzz finding, with the `filer` token ([docs/fuzz-filer.md](docs/fuzz-filer.md), with the install steps) |
+| `systemd/` | `fuzz-token@.service` and `fuzz-token@.timer`, one instance per service; `fuzz-filer.service` and `fuzz-filer.timer` |
 | `script/test` | runs every selftest under `tests/`; CI runs it on every pull request and merge group |
 | `tests/` | the selftests; each one needs no network and no real credential |
 
