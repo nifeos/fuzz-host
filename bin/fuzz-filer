@@ -1,0 +1,776 @@
+#!/usr/bin/python3 -IS
+"""fuzz-filer: file one private security advisory on nifeos/nife for each held fuzz finding.
+
+    fuzz-filer run [--dry-run] [--max N] [--fuzz-home DIR] [--ledger PATH] [--token-file PATH]
+                   [--token-group GROUP] [--api URL] [--pace SECONDS]
+    fuzz-filer ledger [--ledger PATH]
+
+`run` reads the held directory of nife's continuous fuzz supervisor (`<fuzz-home>/state/held/`) and
+its `state/windows.tsv`, and files a draft repository security advisory on nifeos/nife for each held
+log that has none yet. It is a plain program, not an agent and not a language model.
+
+- A finding is one held log, named by its content: the first 16 hexadecimal digits of the SHA-256
+  of the log's bytes. The same log under two names is one finding.
+- The ledger (`/var/lib/fuzz-filer/ledger.tsv`, owned by the account the filer runs as, mode 0600)
+  records each finding as `pending` before the create call and `filed` with the advisory id after
+  it. A finding whose last line is `filed` is never filed again.
+- Before it creates anything, it lists the repository's advisories once and reads the `Finding:`
+  line of each. A finding already on GitHub is recorded as filed and not created again, which covers
+  a run that died between the create and the ledger line, and a lost ledger. A failed listing files
+  nothing.
+- Each advisory names the package `nife` in the ecosystem `other` and a `vulnerable_version_range`
+  of `<= <commit>`, the commit the window ran at. It sets no `patched_versions`, because no fix is
+  known when a finding is filed. GitHub refuses to publish an advisory without a package and range.
+- The advisory's description holds the class, the driver, the commit, the seed (or, for a crash or
+  a hang, the window's first seed and count) and the one-line replay command. Its summary holds the
+  finding id and the class and no seed.
+
+It reads the `filer` token that `fuzz-token` writes (`/run/fuzz-token/filer.env`) and never the App
+key. It refuses, before it opens the held directory, a token file that is a link, is not owned by
+root, has a mode other than 0440, has a group other than `fuzz-token-filer`, records permissions
+other than `repository_advisories:write` or repositories other than `nifeos/nife`, or expires in
+less than 10 minutes.
+
+It never writes a seed, an input, a held log's name or an advisory body to standard output,
+standard error, the journal or the ledger. Its lines name finding ids, ages, advisory ids, counts
+and HTTP statuses. Every message, GitHub's included, passes through a filter that replaces each seed,
+held log name and token it has seen.
+
+Rate: it files at most `--max` advisories a run (default 10), one a second, and stops the run when
+GitHub reports fewer than 100 requests left this hour, or answers 403 or 429 for a rate limit; it
+then exits 75 and the next run continues. It follows only `next` links back to the same listing.
+
+`--dry-run` checks the token, reads the findings and prints what it would file, by id and age, and
+sends nothing. `ledger` prints the ledger's ids, states, advisory ids and ages.
+
+Exit status: 0 when every finding is filed, 1 when anything was refused (each refusal is a journal
+line naming the finding id and age), 75 when a rate limit stopped the run, 3 on a refusal of the
+whole run (the token, the ledger, the held directory or windows.tsv) before anything is sent, 4 on an
+internal error.
+
+`--fuzz-home`, `--ledger`, `--token-file`, `--token-group`, `--api` and `--pace` exist for the
+selftest and for a drop-in; the installed unit passes none of them. `--api` accepts
+https://api.github.com and plain http to a literal loopback address and nothing else, and every
+HTTP redirect is refused.
+
+Name: provisional, as are the subcommands, the paths, the finding id's form, the package name, the
+range's form and the summary's wording. docs/fuzz-filer.md has the install steps.
+
+BUGS
+
+- The count of a crash or hang window is the supervisor's `ask` (1000000), copied here because the
+  supervisor records it nowhere. If the supervisor changes it, this copy is wrong until updated.
+- The replay command is written from the supervisor's own build steps and has not been run by a fix
+  lane yet.
+- Whether GitHub accepts a commit in a `vulnerable_version_range` for the ecosystem `other` is
+  unverified; a refusal is a 422, which this program reports and retries on its next run.
+- Python cannot wipe memory, so the token stays in this process's heap until it exits.
+"""
+
+import argparse
+import errno
+import fcntl
+import grp
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+OWNER = "nifeos"
+REPOSITORY = "nife"
+FULL_NAME = OWNER + "/" + REPOSITORY
+ADVISORIES_PATH = "/repos/%s/%s/security-advisories" % (OWNER, REPOSITORY)
+
+DEFAULT_API = "https://api.github.com"
+DEFAULT_TOKEN_FILE = "/run/fuzz-token/filer.env"
+DEFAULT_TOKEN_GROUP = "fuzz-token-filer"
+DEFAULT_LEDGER = "/var/lib/fuzz-filer/ledger.tsv"
+
+# What the filer token must record, as fuzz-token writes it.
+WANT_PERMISSIONS = "repository_advisories:write"
+TOKEN_MODE = 0o440
+# The token file's owner. The selftest, which cannot make root's files, changes it in process.
+TOKEN_OWNER_UID = 0
+TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_]{1,255}")
+# A token with less than this left is stale: the mint timer runs every 20 minutes and leaves 40.
+MIN_TOKEN_SECONDS = 10 * 60
+# fuzz-token mints one-hour tokens; a file claiming more was not written by it.
+MAX_TOKEN_SECONDS = 61 * 60
+
+LEDGER_MODE = 0o600
+LEDGER_DIR_MODE = 0o700
+
+DEFAULT_MAX = 10
+DEFAULT_PACE = 1.0
+RATE_FLOOR = 100
+MAX_PAGES = 50
+EX_TEMPFAIL = 75
+
+# The supervisor's names and forms (nifeos/nife, helpers/continuous-fuzz.sh).
+HELD_NAME = re.compile(r"^[0-9]{8}T[0-9]{6}Z-([0-9]{1,20})\.log$")
+REPLAY = re.compile(rb"replay: (NIFE_[A-Z_]+_SEEDS)=([0-9]{1,20}):1")
+SLOT_LINE = re.compile(rb"continuous-fuzz: slot [0-9]+: ([a-z-]+), seeds from ([0-9]{1,20}),")
+HELD_CLASSES = ("held-finding", "held-crash", "held-hang")
+DRIVERS = {
+    "kernel-thread": {"variable": "NIFE_SYSCALL_FUZZ_SEEDS", "filter": "seeded_syscalls"},
+    "confined": {"variable": "NIFE_CONFINED_FUZZ_SEEDS", "filter": "a_confined_fuzzer"},
+}
+# The supervisor's `ask`: the seed count a window is built with.
+WINDOW_SEEDS = 1000000
+
+PACKAGE = {"ecosystem": "other", "name": "nife"}
+FINDING_ID = re.compile(r"^[0-9a-f]{16}$")
+FINDING_LINE = re.compile(r"^- Finding: ([0-9a-f]{16})$", re.MULTILINE)
+GHSA_ID = re.compile(r"^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$")
+
+# Every string that must never be printed: the token, each seed, each held log's name.
+SECRETS = []
+
+
+class Refusal(Exception):
+    """A failure with a message meant for a person, printed without a traceback."""
+
+
+class RateLimited(Exception):
+    """GitHub asked this run to stop."""
+
+
+def redact(text):
+    text = str(text)
+    for s in sorted(set(SECRETS), key=len, reverse=True):
+        if s:
+            text = text.replace(s, "[withheld]")
+    return text
+
+
+def say(text, err=False):
+    print("fuzz-filer: " + redact(text), file=sys.stderr if err else sys.stdout, flush=True)
+
+
+def secret(value):
+    value = str(value)
+    if value:
+        SECRETS.append(value)
+    return value
+
+
+def age_text(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 172800:
+        return "%dh" % (seconds // 3600)
+    return "%dd" % (seconds // 86400)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def utc_text(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_utc(text):
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        raise Refusal("the timestamp %r is not a UTC timestamp" % (text,))
+
+
+# The token.
+
+def read_token(path, group_name):
+    """The token, after every check on its file and its recorded fields. Refuses otherwise."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY |
+                     os.O_NONBLOCK)
+    except OSError as e:
+        raise Refusal("the token file %s cannot be opened: %s (a link is refused); is "
+                      "fuzz-token@filer.timer running?" % (path, e.strerror))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refusal("the token file %s is not a regular file" % path)
+        text = os.read(fd, 65536).decode(errors="replace")
+    finally:
+        os.close(fd)
+    fields = {}
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            fields[k] = v
+    token = fields.get("GH_TOKEN", "")
+    if token:
+        secret(token)
+    problems = []
+    if st.st_uid != TOKEN_OWNER_UID:
+        problems.append("it is not owned by uid %d (root)" % TOKEN_OWNER_UID)
+    if stat.S_IMODE(st.st_mode) != TOKEN_MODE:
+        problems.append("its mode is %04o, not %04o" % (stat.S_IMODE(st.st_mode), TOKEN_MODE))
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = "gid %d" % st.st_gid
+    if group != group_name:
+        problems.append("its group is %s, not %s" % (group, group_name))
+    if not TOKEN_SHAPE.fullmatch(token):
+        problems.append("it holds no token of the expected shape")
+    if fields.get("GH_TOKEN_PERMISSIONS") != WANT_PERMISSIONS:
+        problems.append("it records the permissions %r, not %s (the wrong profile?)"
+                        % (fields.get("GH_TOKEN_PERMISSIONS"), WANT_PERMISSIONS))
+    if fields.get("GH_TOKEN_REPOSITORIES") != FULL_NAME:
+        problems.append("it records the repositories %r, not %s"
+                        % (fields.get("GH_TOKEN_REPOSITORIES"), FULL_NAME))
+    try:
+        left = (parse_utc(fields.get("GH_TOKEN_EXPIRES_AT")) - utc_now()).total_seconds()
+        if left < MIN_TOKEN_SECONDS:
+            problems.append("it expires in %d seconds, less than %d (stale; is "
+                            "fuzz-token@filer.timer running?)" % (left, MIN_TOKEN_SECONDS))
+        elif left > MAX_TOKEN_SECONDS:
+            problems.append("it claims %d seconds of life, more than an installation token has"
+                            % left)
+    except Refusal:
+        problems.append("it records no expiry")
+    if problems:
+        raise Refusal("the token file %s is refused: %s" % (path, "; ".join(problems)))
+    return token
+
+
+# GitHub.
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the bearer elsewhere; every one is refused."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Refusal("GitHub answered %s %s with a redirect (HTTP %d); redirects are refused"
+                      % (req.get_method(), urllib.parse.urlsplit(req.full_url).path, code))
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def check_api(api):
+    """The API base, refused unless it is exactly https://api.github.com, or plain http to a literal
+    loopback address (the selftest's stub)."""
+    try:
+        u = urllib.parse.urlsplit(api)
+        port = u.port
+    except ValueError:
+        raise Refusal("the API address %s does not parse" % api)
+    bare = not (u.username or u.password or u.query or u.fragment or u.path not in ("", "/"))
+    if bare and u.scheme == "https" and u.hostname == "api.github.com" and port in (None, 443):
+        return api.rstrip("/")
+    if bare and u.scheme == "http" and u.hostname:
+        try:
+            ip = ipaddress.ip_address(u.hostname)
+        except ValueError:
+            ip = None
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if ip is not None and mapped is None and ip.is_loopback:
+            return api.rstrip("/")
+    raise Refusal("the API address %s is neither https://api.github.com nor plain http to a "
+                  "loopback address" % api)
+
+
+class GitHub:
+    def __init__(self, api, token):
+        self.api = check_api(api)
+        self.token = token
+        self.remaining = None
+
+    def call(self, method, url, body=None):
+        """(status, decoded JSON, headers). Raises RateLimited or Refusal; never prints the body."""
+        if not url.startswith(self.api + "/"):
+            raise Refusal("refused a request outside %s" % self.api)
+        req = urllib.request.Request(url, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None)
+        req.add_header("Authorization", "Bearer " + self.token)
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        req.add_header("User-Agent", "nifeos-fuzz-filer")
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+        path = urllib.parse.urlsplit(url).path
+        try:
+            with OPENER.open(req, timeout=30) as resp:
+                self.note_rate(resp.headers)
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else None), resp.headers
+        except urllib.error.HTTPError as e:
+            self.note_rate(e.headers)
+            try:
+                answer = json.loads(e.read())
+                msg = str(answer.get("message", ""))
+                errors = answer.get("errors") or []
+            except (ValueError, AttributeError):
+                msg, errors = "", []
+            if method != "GET":
+                # An answer to a create may echo the advisory back; print only the field names and
+                # error codes, which are GitHub's own fixed words.
+                words = re.compile(r"[A-Za-z_]{1,40}")
+                shown = ["%s:%s" % (x.get("field"), x.get("code")) for x in errors
+                         if isinstance(x, dict) and words.fullmatch(str(x.get("field"))) and
+                         words.fullmatch(str(x.get("code")))]
+                detail = ("the fields and codes " + ", ".join(shown)) if shown else \
+                    "its message is not printed, because it may echo the advisory"
+            else:
+                detail = msg[:200]
+            limited = e.code == 429 or (e.code == 403 and (
+                self.remaining == 0 or "rate limit" in str(msg).lower() or
+                e.headers.get("Retry-After")))
+            if limited:
+                raise RateLimited("GitHub answered HTTP %d to %s %s (a rate limit; retry after "
+                                  "%s seconds)" % (e.code, method, path,
+                                                   e.headers.get("Retry-After") or "some"))
+            raise Refusal("GitHub answered HTTP %d to %s %s: %s" % (e.code, method, path, detail))
+        except urllib.error.URLError as e:
+            raise Refusal("could not reach GitHub for %s %s: %s" % (method, path, e.reason))
+        except (OSError, ValueError) as e:
+            raise Refusal("the answer to %s %s broke off or is not JSON (%s)"
+                          % (method, path, type(e).__name__))
+
+    def note_rate(self, headers):
+        if headers is None:
+            return
+        try:
+            self.remaining = int(headers.get("X-RateLimit-Remaining"))
+        except (TypeError, ValueError):
+            pass
+
+    def low(self):
+        return self.remaining is not None and self.remaining < RATE_FLOOR
+
+    def filed_findings(self):
+        """{finding id: advisory id} for every advisory on the repository that carries a Finding
+        line, read from every page. Refuses on any failure, so a caller files nothing."""
+        found = {}
+        url = self.api + ADVISORIES_PATH + "?per_page=100"
+        for _ in range(MAX_PAGES):
+            status, page, headers = self.call("GET", url)
+            if status != 200 or not isinstance(page, list):
+                raise Refusal("the advisory listing answered HTTP %d without a list" % status)
+            for adv in page:
+                if not isinstance(adv, dict):
+                    continue
+                ghsa = adv.get("ghsa_id")
+                for fid in FINDING_LINE.findall(adv.get("description") or ""):
+                    if isinstance(ghsa, str) and GHSA_ID.match(ghsa):
+                        found.setdefault(fid, ghsa)
+            url = next_link(headers.get("Link"), self.api)
+            if url is None:
+                return found
+        raise Refusal("the advisory listing runs past %d pages" % MAX_PAGES)
+
+
+def next_link(header, api):
+    """The `next` URL of a Link header, refused unless it is the same listing on the same API."""
+    if not header:
+        return None
+    for part in header.split(","):
+        m = re.match(r'\s*<([^>]*)>\s*;\s*rel="next"\s*$', part)
+        if m:
+            u = m.group(1)
+            if urllib.parse.urlsplit(u).path != ADVISORIES_PATH or \
+                    not u.startswith(api + ADVISORIES_PATH + "?"):
+                raise Refusal("the advisory listing's next page points elsewhere; refused")
+            return u
+    return None
+
+
+# The ledger: an agreement with the programs that read it, held in this code (ledger_state).
+
+def open_ledger(path):
+    """(fd of the lock, ledger state). Creates the ledger mode 0600 in a 0700 directory owned by
+    this account, refuses any other shape, and holds an exclusive lock for the run."""
+    d = os.path.dirname(path) or "."
+    try:
+        st = os.lstat(d)
+    except OSError as e:
+        raise Refusal("the ledger directory %s: %s" % (d, e.strerror))
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or \
+            stat.S_IMODE(st.st_mode) != LEDGER_DIR_MODE:
+        raise Refusal("the ledger directory %s must be a directory owned by this account, mode "
+                      "%04o, and not a link" % (d, LEDGER_DIR_MODE))
+    try:
+        lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                       LEDGER_MODE)
+    except OSError as e:
+        raise Refusal("the ledger lock %s.lock: %s" % (path, e.strerror))
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock)
+        raise Refusal("another run holds the ledger lock")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     LEDGER_MODE)
+    except OSError as e:
+        os.close(lock)
+        raise Refusal("the ledger %s cannot be opened: %s (a link is refused)" % (path, e.strerror))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or \
+                stat.S_IMODE(st.st_mode) != LEDGER_MODE:
+            raise Refusal("the ledger %s must be a regular file owned by this account, mode %04o"
+                          % (path, LEDGER_MODE))
+        chunks = []
+        while True:
+            b = os.pread(fd, 1 << 16, sum(len(c) for c in chunks))
+            if not b:
+                break
+            chunks.append(b)
+        state = ledger_state(b"".join(chunks).decode(errors="replace"))
+    except Refusal:
+        os.close(fd)
+        os.close(lock)
+        raise
+    return lock, fd, state
+
+
+def ledger_state(text):
+    """{finding id: (state, advisory id or None, utc)} from the ledger's text, the last line of each
+    finding winning. A line is `utc<TAB>finding<TAB>pending|filed<TAB>advisory id or -`; lines
+    starting with # are comments. Any other line refuses the whole ledger."""
+    state = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        ok = len(parts) == 4 and FINDING_ID.match(parts[1]) and (
+            (parts[2] == "pending" and parts[3] == "-") or
+            (parts[2] == "filed" and GHSA_ID.match(parts[3])))
+        if not ok:
+            raise Refusal("the ledger's line %d is not a ledger line; nothing is filed until a "
+                          "person mends it" % n)
+        parse_utc(parts[0])
+        state[parts[1]] = (parts[2], None if parts[3] == "-" else parts[3], parts[0])
+    return state
+
+
+def ledger_append(fd, finding, what, ghsa=None):
+    line = "%s\t%s\t%s\t%s\n" % (utc_text(utc_now()), finding, what, ghsa or "-")
+    os.write(fd, line.encode())
+    os.fsync(fd)
+
+
+# The findings.
+
+def read_windows(path):
+    """{first seed: [(utc, driver, commit, status)]} for each held row of windows.tsv."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Refusal("windows.tsv cannot be opened: %s (a link is refused)" % e.strerror)
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise Refusal("windows.tsv is not a regular file")
+        rows = {}
+        for raw in f:
+            parts = raw.decode(errors="replace").rstrip("\n").split("\t")
+            if len(parts) == 8 and parts[6] in HELD_CLASSES and parts[3].isdigit():
+                secret(parts[3])
+                rows.setdefault(parts[3], []).append((parts[0], parts[1], parts[7], parts[6]))
+    return rows
+
+
+def held_logs(held):
+    """[(name, sha256 hex, mtime, replay match or None, slot match or None)] for each regular file
+    under the held directory whose name is the supervisor's, and the count of other entries."""
+    try:
+        st = os.lstat(held)
+    except OSError as e:
+        raise Refusal("the held directory cannot be read: %s" % e.strerror)
+    if not stat.S_ISDIR(st.st_mode) or stat.S_IMODE(st.st_mode) & 0o022:
+        raise Refusal("the held directory must be a directory, not a link, and writable by its "
+                      "owner alone")
+    out, other = [], 0
+    for name in sorted(os.listdir(held)):
+        m = HELD_NAME.match(name)
+        if not m:
+            other += 1
+            continue
+        secret(name)
+        secret(m.group(1))
+        try:
+            fd = os.open(os.path.join(held, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
+                         os.O_NONBLOCK)
+        except OSError:
+            other += 1
+            continue
+        with os.fdopen(fd, "rb") as f:
+            fst = os.fstat(f.fileno())
+            if not stat.S_ISREG(fst.st_mode):
+                other += 1
+                continue
+            h = hashlib.sha256()
+            replay = slot = None
+            for raw in f:
+                h.update(raw)
+                if replay is None:
+                    replay = REPLAY.search(raw)
+                if slot is None:
+                    slot = SLOT_LINE.search(raw)
+        if replay:
+            secret(replay.group(2).decode())
+        out.append((name, h.hexdigest(), fst.st_mtime, replay, slot))
+    return out, other
+
+
+def describe(name, digest, replay, slot, windows):
+    """The finding's fields for its advisory, or a Refusal naming what does not agree."""
+    first = HELD_NAME.match(name).group(1)
+    rows = sorted(set(windows.get(first, [])))
+    if not rows:
+        raise Refusal("windows.tsv holds no held row for it")
+    if len({(r[1], r[2], r[3]) for r in rows}) != 1:
+        raise Refusal("windows.tsv holds conflicting held rows for it")
+    held_at, driver, commit, status = rows[0]
+    if driver not in DRIVERS:
+        raise Refusal("its row names an unknown driver")
+    if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
+        raise Refusal("its row's commit is not a commit")
+    if slot is not None and (slot.group(1).decode() != driver or slot.group(2).decode() != first):
+        raise Refusal("its log and its row name different windows")
+    variable = DRIVERS[driver]["variable"]
+    if status == "held-finding":
+        if replay is None:
+            raise Refusal("its row says held-finding and its log holds no replay line")
+        if replay.group(1).decode() != variable:
+            raise Refusal("its replay line names another driver's variable")
+        seed = int(replay.group(2))
+        if seed < int(first):
+            raise Refusal("its replay seed lies before its window")
+        seeds = "%d:1" % seed
+    else:
+        seeds = "%s:%d" % (first, WINDOW_SEEDS)
+    return {"finding": digest[:16], "class": status, "driver": driver, "commit": commit,
+            "held_at": held_at, "seeds": seeds, "variable": variable,
+            "filter": DRIVERS[driver]["filter"]}
+
+
+def advisory_body(f):
+    """The create call's body. The summary holds no seed; the description holds the reproducer."""
+    if f["class"] == "held-finding":
+        seed_line = "- Seed: `%s`" % f["seeds"].split(":")[0]
+    else:
+        seed_line = "- Seed range (first:count): `%s`" % f["seeds"]
+    replay = ("%s=%s NIFE_TEST_FILTER=%s NIFE_TEST_FILTER_ACROSS_IMAGES=1 cargo xtask test"
+              % (f["variable"], f["seeds"], f["filter"]))
+    description = "\n".join([
+        "A finding of nife's continuous fuzz host, filed by fuzz-filer, a program on the host. "
+        "It stays private until its fix is on main and a rerun of its input passes against that "
+        "build, or until 90 days after this report.",
+        "",
+        "- Finding: %s" % f["finding"],
+        "- Class: %s" % f["class"],
+        "- Driver: %s" % f["driver"],
+        "- Commit: %s" % f["commit"],
+        seed_line,
+        "- Held at: %s" % f["held_at"],
+        "",
+        "Replay, in a checkout of that commit:",
+        "",
+        "```sh",
+        replay,
+        "```",
+        "",
+        "Never copy the seed, the replay line or the guest's output into a pull request, an issue, "
+        "a commit message or any other public text before this advisory is published.",
+    ])
+    return {
+        "summary": "Held fuzz finding %s (%s, %s driver)" % (f["finding"], f["class"],
+                                                             f["driver"]),
+        "description": description,
+        "vulnerabilities": [{
+            "package": dict(PACKAGE),
+            "vulnerable_version_range": "<= %s" % f["commit"],
+            "vulnerable_functions": [],
+        }],
+    }
+
+
+def check_created(answer, finding):
+    """The advisory id GitHub gave, and a list of what is wrong with the draft it made."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("ghsa_id"), str) or \
+            not GHSA_ID.match(answer["ghsa_id"]):
+        raise Refusal("GitHub's answer to the create names no advisory id")
+    wrong = []
+    if answer.get("state") != "draft":
+        wrong.append("its state is %r, not draft" % (answer.get("state"),))
+    vulns = answer.get("vulnerabilities")
+    ok = isinstance(vulns, list) and vulns and all(
+        isinstance(v, dict) and isinstance(v.get("package"), dict) and
+        v["package"].get("ecosystem") and v["package"].get("name") and
+        v.get("vulnerable_version_range") for v in vulns)
+    if not ok:
+        wrong.append("it lacks a package or a vulnerable version range, so it cannot be published")
+    if finding not in FINDING_LINE.findall(answer.get("description") or ""):
+        wrong.append("its description lost the Finding line")
+    return answer["ghsa_id"], wrong
+
+
+# The run.
+
+def run(args):
+    token = read_token(args.token_file, args.token_group)
+    github = GitHub(args.api, token)
+    home = args.fuzz_home
+    lock, fd, ledger = open_ledger(args.ledger)
+    try:
+        return file_findings(args, github, home, fd, ledger)
+    finally:
+        os.close(fd)
+        os.close(lock)
+
+
+def file_findings(args, github, home, fd, ledger):
+    held = os.path.join(home, "state", "held")
+    logs, other = held_logs(held)
+    windows = read_windows(os.path.join(home, "state", "windows.tsv")) if logs else {}
+    if other:
+        say("the held directory holds %d entries that are not held logs; they are not read"
+            % other, err=True)
+    now = time.time()
+    refused = 0
+    todo, seen = [], set()
+    for name, digest, mtime, replay, slot in logs:
+        fid = digest[:16]
+        age = age_text(now - mtime)
+        if fid in seen:
+            continue
+        seen.add(fid)
+        if ledger.get(fid, ("",))[0] == "filed":
+            continue
+        try:
+            todo.append((describe(name, digest, replay, slot, windows), age))
+        except Refusal as e:
+            refused += 1
+            say("finding %s (held %s) is refused: %s" % (fid, age, e), err=True)
+    filed = sum(1 for v in ledger.values() if v[0] == "filed")
+    if not todo:
+        say("%d held findings, %d filed before, none to file" % (len(seen), filed))
+        return 1 if refused else 0
+    if args.dry_run:
+        for f, age in todo:
+            say("would file finding %s (held %s)" % (f["finding"], age))
+        return 1 if refused else 0
+
+    try:
+        on_github = github.filed_findings()
+    except RateLimited as e:
+        say("%s; nothing is filed this run" % e, err=True)
+        return EX_TEMPFAIL
+    except Refusal as e:
+        say("%s; nothing is filed this run, so nothing is filed twice" % e, err=True)
+        return 1
+    created = 0
+    for i, (f, age) in enumerate(todo):
+        fid = f["finding"]
+        if fid in on_github:
+            ledger_append(fd, fid, "filed", on_github[fid])
+            say("finding %s (held %s) is already advisory %s; recorded" % (fid, age,
+                                                                            on_github[fid]))
+            continue
+        if created >= args.max:
+            left = sum(1 for g, _ in todo[i:] if g["finding"] not in on_github)
+            say("%d findings wait for the next run (at most %d a run)" % (left, args.max))
+            break
+        if github.low():
+            say("GitHub reports %d requests left this hour; the rest wait for the next run"
+                % github.remaining, err=True)
+            return EX_TEMPFAIL
+        if created:
+            time.sleep(args.pace)
+        ledger_append(fd, fid, "pending")
+        try:
+            status, answer, _ = github.call("POST", github.api + ADVISORIES_PATH, advisory_body(f))
+        except RateLimited as e:
+            say("finding %s (held %s): %s; the rest wait for the next run" % (fid, age, e),
+                err=True)
+            return EX_TEMPFAIL
+        except Refusal as e:
+            refused += 1
+            say("finding %s (held %s) was not filed: %s; the next run looks for it on GitHub "
+                "before it files again" % (fid, age, e), err=True)
+            continue
+        created += 1
+        if status != 201:
+            refused += 1
+            say("finding %s (held %s): the create answered HTTP %d, not 201" % (fid, age, status),
+                err=True)
+            continue
+        try:
+            ghsa, wrong = check_created(answer, fid)
+        except Refusal as e:
+            refused += 1
+            say("finding %s (held %s): %s; the next run looks for it on GitHub" % (fid, age, e),
+                err=True)
+            continue
+        ledger_append(fd, fid, "filed", ghsa)
+        say("filed finding %s (held %s) as %s" % (fid, age, ghsa))
+        for w in wrong:
+            refused += 1
+            say("advisory %s for finding %s: %s" % (ghsa, fid, w), err=True)
+    return 1 if refused else 0
+
+
+def show_ledger(args):
+    try:
+        with open(args.ledger, "rb") as f:
+            state = ledger_state(f.read().decode(errors="replace"))
+    except FileNotFoundError:
+        state = {}
+    now = utc_now()
+    for fid, (what, ghsa, when) in sorted(state.items(), key=lambda kv: kv[1][2]):
+        print("%s\t%s\t%s\t%s ago" % (fid, what, ghsa or "-",
+                                      age_text((now - parse_utc(when)).total_seconds())))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="fuzz-filer",
+                                 description="File each held fuzz finding as a private advisory.")
+    sub = ap.add_subparsers(dest="command", required=True)
+    r = sub.add_parser("run", help="file every held finding that has no advisory yet")
+    r.add_argument("--dry-run", action="store_true", help="send nothing; print what would be filed")
+    r.add_argument("--max", type=int, default=DEFAULT_MAX, help="advisories to create a run")
+    r.add_argument("--fuzz-home", default=None,
+                   help="the supervisor's NIFE_FUZZ_HOME (default: that variable, else ~/fuzz)")
+    r.add_argument("--ledger", default=DEFAULT_LEDGER)
+    r.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
+    r.add_argument("--token-group", default=DEFAULT_TOKEN_GROUP)
+    r.add_argument("--api", default=DEFAULT_API)
+    r.add_argument("--pace", type=float, default=DEFAULT_PACE, help="seconds between creates")
+    r.set_defaults(run=run)
+    g = sub.add_parser("ledger", help="print the ledger: ids, states, advisory ids, ages")
+    g.add_argument("--ledger", default=DEFAULT_LEDGER)
+    g.set_defaults(run=show_ledger)
+    args = ap.parse_args(argv)
+    if args.command == "run":
+        if args.fuzz_home is None:
+            args.fuzz_home = os.environ.get("NIFE_FUZZ_HOME") or \
+                os.path.join(os.path.expanduser("~"), "fuzz")
+        if args.max < 1:
+            ap.error("--max must be at least 1")
+    try:
+        return args.run(args)
+    except Refusal as e:
+        say(e, err=True)
+        return 3
+    except Exception as e:  # noqa: BLE001; a traceback could carry a seed in a local's repr
+        say("internal error (%s); nothing more is printed, because the message could carry a "
+            "seed or the token" % type(e).__name__, err=True)
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
