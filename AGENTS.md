@@ -18,7 +18,8 @@ private key, so the rules below are stricter than a library's.
   the fuzz host. A person installs what this repository ships. Selftests make their own throwaway
   keys and talk to a local stub, never to GitHub.
 - A helper that holds a secret never puts it in argv, in the journal, in an error message or on
-  standard output. A selftest proves that for each one.
+  standard output. A selftest proves that for each one. The single exception is `fuzz-token issue reader`, which writes a one-hour
+  advisory-read token to a pipe for the lane that asked ([docs/fuzz-token-reader.md](docs/fuzz-token-reader.md)).
 - Python's standard library and the `openssl` binary are the dependencies. Any other one needs an
   architect's ruling first.
 

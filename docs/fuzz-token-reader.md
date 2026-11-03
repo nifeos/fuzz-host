@@ -2,7 +2,7 @@
 
 *Name: provisional, as are the profile name `reader`, the subcommand `issue`, the flag `--fresh`,
 the key path `/etc/nife-fuzz-reader/nife-fuzz-reader.private-key.pem` and the sudoers file name
-`fuzz-token-reader`. The delivery channel below is provisional too, and waits for an architect.*
+`fuzz-token-reader`.*
 
 A held finding reaches the lane that fixes it only as a private security advisory on nifeos/nife.
 The lane reads that advisory with a token of the `nife-fuzz-reader` GitHub App (App ID 5571868,
@@ -53,9 +53,14 @@ A lane's own discipline does the rest: it never echoes `GH_TOKEN`, never runs th
 
 ## Choosing the channel
 
+Ruled 2026-11-03: fix lanes get the reader token through a sudo rule naming exactly `fuzz-token issue
+reader`, which is channel 1 below. Tokens stay at one hour and no long-lived credential is kept.
+The single exception to the repository's rule that a helper never prints a secret is this one
+command, and `AGENTS.md` names it.
+
 Every channel below keeps the key in root's file and in the helper's memory for a few seconds. They
-differ in where the token lives and who can take one. This is a provisional choice for the
-architect.
+differ in where the token lives and who can take one. The choice
+below is ruled.
 
 1. **A narrow sudo rule and a token on standard output (chosen).** The token exists only when a
    lane asks for it, travels on a pipe to that lane, and is held by nothing afterwards. sudo
@@ -64,7 +69,7 @@ architect.
    root code path that the lane account can start: the helper runs Python with `-IS`, takes no
    argument the rule does not fix, and clears its environment. It is also the one place a
    `fuzz-host` helper puts a secret on standard output, which the repository's rules otherwise
-   forbid; that exception is part of what the architect rules on.
+   forbid; the 2026-11-03 ruling accepts that exception.
 2. **A root timer writing a token file the lane account can read.** This is `fuzz-token mint
    reader --reader <account> --group fuzz-token-reader`, the fuzz host's own channel, and it works
    today with no new code. No sudo rule and no secret on standard output. But the token exists all
@@ -81,11 +86,12 @@ architect.
    this shape, but the token then sits in the lane's whole environment for its life, which the
    proposal also forbids, and it is stale after an hour while a lane may run for several.
 
-The recommendation is 1: it is the narrowest standing exposure (nothing exists until a lane asks)
-and it leaves a trace. If the architect keeps the rule that no helper prints a secret, 2 is the
+Channel 1 was chosen because it is the narrowest standing exposure (nothing exists until a lane asks)
+and it leaves a trace. Channel 2 stays the
 fallback and needs nothing but its install steps.
 
-**What this does not isolate.** Every lane runs as the same account, so any lane on the machine can
+**What this does not isolate.** Ruled 2026-11-03: any lane on the machine may take a reader token,
+and the split of accounts is revisited after the first fix lane runs. Every lane runs as the same account, so any lane on the machine can
 ask for a reader token, not only the fix lane for one advisory, and the token reads every advisory
 on nifeos/nife. The protection is that the key stays root's and the token lives an hour. It also
 holds only if the lane account cannot become root another way: an account with general sudo
