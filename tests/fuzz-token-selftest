@@ -629,7 +629,7 @@ def run(tmp, keep_server):
 
     # 9. An expired JWT, signed in process, is refused by the stub, and the helper says so.
     ok_, msg = refused(MOD.exchange, api,
-                       MOD.sign_jwt(MOD.check_key(key, ME), wrapper, time.time() - 3600),
+                       MOD.sign_jwt(MOD.check_key(key, ME), "5571801", wrapper, time.time() - 3600),
                        "publish")
     check("an expired JWT is refused with HTTP 401", ok_ and "401" in msg and state["expired_jwt"]
           == 1, msg)
@@ -673,7 +673,7 @@ def run(tmp, keep_server):
     r = helper("mint", "nonesuch")
     check("an unknown profile is refused", r.returncode != 0, r.stderr)
     r = helper("profiles")
-    check("profiles lists both", "publish" in r.stdout and "filer" in r.stdout, r.stdout)
+    check("profiles lists all three", all(p in r.stdout for p in ("publish", "filer", "reader")), r.stdout)
 
     # 11. Nothing holds a secret where it should not.
     secrets = [t for t in state["issued"]] + [j for j in state["jwts"] if j]
