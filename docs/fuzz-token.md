@@ -13,6 +13,11 @@ one-hour installation tokens, one per service, each holding less than the App do
 | `publish` | Contents write | `lane` | `fuzz-token-publish` | the daily fuzz release |
 | `filer` | Repository security advisories write | `lane` | `fuzz-token-filer` | the finding filer |
 
+A third profile, `reader`, belongs to a different App, `nife-fuzz-reader`, whose key never sits on
+the fuzz host. It gives a fix lane a token that reads advisories, on another machine, and
+[fuzz-token-reader.md](fuzz-token-reader.md) describes it. The code is the same; each profile names
+its App, and the App names its id, its installation and its key path.
+
 GitHub adds Metadata read to every token. Each token reaches nifeos/nife alone. When GitHub's answer
 grants anything more, or lists any other repository, `fuzz-token` revokes the token and writes
 nothing.
@@ -50,20 +55,22 @@ mints a fresh token every 20 minutes, so the file always holds one with at least
 - It never prints, logs or stores the key. The key leaves the process only on a pipe to `openssl`,
   which signs the JSON Web Token.
 - It never puts the key or a token in an argument list, on standard output, on standard error, in
-  the journal or in an error message. The token file is the one place a token is written.
-- It refuses a key file that is a link or not a regular file, is not owned by root, or has any mode
-  but 0400, and a key directory that is a link or is not owned by root with mode 0700, before it
-  reads a byte.
+  the journal or in an error message. The token file is the one place a token is written. The one
+  exception is `issue reader`, which exists for fix lanes on another machine and writes its token
+  to a pipe ([fuzz-token-reader.md](fuzz-token-reader.md)); it refuses every profile on this host.
+- It refuses a key file that is a link or not a regular file, is not owned by root, has any mode
+  but 0400 or carries a POSIX ACL, and a key directory that is a link, is not owned by root with
+  mode 0700 or carries a POSIX ACL, before it reads a byte.
 - It refuses a token GitHub grants wider or narrower than asked, for another repository, without an
   expiry, or of an unexpected shape, and revokes it. It refuses every HTTP redirect. It talks to
   `https://api.github.com` and nothing else, except plain http to a literal loopback address, which
-  exists for the selftest's stub.
+  exists for the selftest's stub, and no proxy variable in its environment reroutes a call.
 - It runs `/usr/bin/openssl` with `PATH=/usr/bin:/bin` and nothing else in its environment, and
   Python with `-IS`, so neither the caller's environment nor site packages reach it.
 - It runs from a root-owned copy outside any clone. The host's update from nife's main never
   replaces it, and neither does any change to this repository until a person installs it.
 
-`tests/fuzz-token-selftest` holds each of these against a throwaway key and a local stub of GitHub.
+`tests/fuzz-token-selftest` and `tests/fuzz-token-reader-selftest` hold each of these against a throwaway key and a local stub of GitHub.
 
 ## Install, for a person with root on the fuzz host
 
@@ -92,7 +99,9 @@ Verify. After each command, the text after the colon is its expected output:
 - `sudo stat -c '%U %G %a' /run/fuzz-token /run/fuzz-token/publish.env`: `root root 711`, then
   `root fuzz-token-publish 440`.
 - `sudo /usr/local/sbin/fuzz-token check publish`: a `repositories: nifeos/nife` line, an
-  `expires:` line about an hour ahead, and exit status 0. It never prints the token. It fails
+  `expires:` line about an hour ahead, and exit status 0. It never prints the token.
+  `sudo /usr/local/sbin/fuzz-token check publish --fresh` mints a token from the key instead, prints
+  the permissions GitHub granted, and revokes it. It fails
   unless the file is a regular file owned by root, with the group `fuzz-token-publish`, mode 0440
   and no POSIX ACL, and prints an `acl:` line when it finds one.
 - `systemctl list-timers 'fuzz-token@*'`: the next run within 20 minutes.
