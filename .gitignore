@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# Selftest scratch, and never a key or a token.
+/scratch/
+*.pem
+*.token
