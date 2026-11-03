@@ -1,7 +1,8 @@
-#!/usr/bin/python3 -I
+#!/usr/bin/python3 -IS
 """fuzz-token: mint one narrowed installation token of the nife-fuzz GitHub App for one service.
 
-    fuzz-token mint PROFILE [--reader USER] [--key PATH] [--out-dir DIR] [--api URL]
+    fuzz-token mint PROFILE [--reader USER] [--group GROUP] [--key PATH] [--out-dir DIR]
+                    [--api URL] [--openssl PATH]
     fuzz-token check PROFILE [--out-dir DIR] [--api URL]
     fuzz-token profiles
 
@@ -9,8 +10,11 @@
 the `openssl` binary, the key handed over on a pipe), and exchanges it for an installation token
 that holds only the profile's permissions on nifeos/nife alone and lives one hour. It refuses the
 answer, and revokes the token, when GitHub grants more than it asked for or any other repository.
-It writes the token to `<out-dir>/<profile>.env`, owned by the reader account, mode 0400, in a form
-both a shell and systemd's `EnvironmentFile=` read:
+It writes the token to `<out-dir>/<profile>.env`, owned by root and by the profile's group, mode
+0440, in a form both a shell and systemd's `EnvironmentFile=` read. The group must hold the reader
+account and no other, as a member or as a primary group; anything else refuses. The reader can read
+the file and can neither change its mode nor rewrite it, so a file systemd parses as root stays
+root's:
 
     GH_TOKEN=...
     GH_TOKEN_EXPIRES_AT=2026-11-03T14:00:00Z
@@ -24,7 +28,11 @@ at least 40 minutes left.
 the expiry and the recorded permissions. It never prints the token. It exits 1 unless the list is
 exactly nifeos/nife and the token is unexpired.
 
-`profiles` prints each profile, its permissions and its default reader.
+`profiles` prints each profile, its permissions, its default reader and its default group.
+
+Each profile's token is narrower than the App, but two profiles whose readers are one account give
+no isolation between them: that account holds both tokens. `--reader` and `--group` are per profile,
+so a profile gets its own account through a drop-in on its unit, with no change here.
 
 The key never leaves this process except on the pipe to `openssl`. Neither the key nor a token
 appears in an argument list, on standard output, on standard error or in an error message, and the
@@ -32,8 +40,10 @@ token file is the only place a token is written. The key file must be a regular 
 owned by the user running this, mode 0400, in a directory owned by that user, mode 0700; anything
 else is refused before the file is read. On the host that user is root.
 
-The flags other than PROFILE exist for the selftest. The installed unit passes none, so the host
-always uses the defaults below.
+`--reader` and `--group` exist for a drop-in that gives a profile its own account. `--key`,
+`--out-dir`, `--api` and `--openssl` exist for the selftest; the installed unit passes none of them.
+`--api` refuses any address that is not https, except a loopback one, and the helper refuses every
+HTTP redirect.
 
 Name: provisional, as are the profile names and the paths. docs/fuzz-token.md has the install
 steps for a person with root.
@@ -44,19 +54,25 @@ BUGS
   The process lives a few seconds.
 - GitHub's answer lists the repositories only when the request names them. This helper always names
   nife, and refuses an answer without the list.
+- Both profiles default to the reader `lane`, so until each has its own account the split narrows
+  each token but isolates nothing between them.
 """
 
 import argparse
 import base64
 import json
 import os
+import grp
+import ipaddress
 import pwd
+import re
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -69,9 +85,16 @@ FULL_NAME = OWNER + "/" + REPOSITORY
 DEFAULT_KEY = "/etc/nife-fuzz/nife-fuzz.private-key.pem"
 DEFAULT_OUT_DIR = "/run/fuzz-token"
 DEFAULT_API = "https://api.github.com"
+DEFAULT_OPENSSL = "/usr/bin/openssl"
+# openssl runs with this PATH and nothing else in its environment.
+OPENSSL_ENV = {"PATH": "/usr/bin:/bin"}
+# What GitHub's installation tokens look like today (ghs_ and 36 characters); anything else is
+# refused rather than written into a file systemd parses.
+TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_]{1,255}")
 
 # One token per service, each narrowed below the App's permissions (Contents write and Repository
-# security advisories write; GitHub adds Metadata read to every token).
+# security advisories write; GitHub adds Metadata read to every token). The reader and group are
+# defaults; a unit drop-in overrides them per profile.
 PROFILES = {
     "publish": {"permissions": {"contents": "write"}, "reader": "lane",
                 "what": "the daily fuzz release (gh release create)"},
@@ -84,7 +107,7 @@ IMPLICIT = {"metadata": "read"}
 KEY_MODE = 0o400
 KEY_DIR_MODE = 0o700
 OUT_DIR_MODE = 0o711
-TOKEN_MODE = 0o400
+TOKEN_MODE = 0o440
 
 # Every secret this process has seen; refusal messages pass through redact() before printing.
 SECRETS = []
@@ -113,24 +136,31 @@ def mode_text(st):
 def check_key(path, uid):
     """The key's bytes, after checking its directory and the file itself.
 
-    The directory must be a real directory owned by `uid`, mode 0700. The file is opened without
-    following a link and checked on the open descriptor: a regular file owned by `uid`, mode 0400.
-    Anything else refuses before a byte is read."""
-    directory = os.path.dirname(os.path.abspath(path))
+    The directory is opened without following a link and checked on its descriptor: a directory
+    owned by `uid`, mode 0700. The key is opened relative to that descriptor, again without
+    following a link and without blocking on a FIFO, and checked on its own descriptor: a regular
+    file owned by `uid`, mode 0400. Anything else refuses before a byte is read."""
+    path = os.path.abspath(path)
+    directory, name = os.path.split(path)
     try:
-        dst = os.lstat(directory)
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as e:
-        raise Refusal("the key directory %s cannot be read: %s" % (directory, e.strerror))
-    if not stat.S_ISDIR(dst.st_mode):
-        raise Refusal("the key directory %s is not a directory (a link is refused)" % directory)
-    if dst.st_uid != uid or stat.S_IMODE(dst.st_mode) != KEY_DIR_MODE:
-        raise Refusal("the key directory %s is owned by uid %d with mode %s; it must be uid %d, "
-                      "mode %04o" % (directory, dst.st_uid, mode_text(dst), uid, KEY_DIR_MODE))
+        raise Refusal("the key directory %s cannot be opened: %s (a link is refused)"
+                      % (directory, e.strerror))
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY)
-    except OSError as e:
-        raise Refusal("the key file %s cannot be opened: %s (a link is refused)"
-                      % (path, e.strerror))
+        dst = os.fstat(dfd)
+        if dst.st_uid != uid or stat.S_IMODE(dst.st_mode) != KEY_DIR_MODE:
+            raise Refusal("the key directory %s is owned by uid %d with mode %s; it must be uid "
+                          "%d, mode %04o" % (directory, dst.st_uid, mode_text(dst), uid,
+                                             KEY_DIR_MODE))
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY |
+                         os.O_NONBLOCK, dir_fd=dfd)
+        except OSError as e:
+            raise Refusal("the key file %s cannot be opened: %s (a link is refused)"
+                          % (path, e.strerror))
+    finally:
+        os.close(dfd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -152,7 +182,7 @@ def check_key(path, uid):
     return key
 
 
-def sign_jwt(key, now=None):
+def sign_jwt(key, openssl=DEFAULT_OPENSSL, now=None):
     """A JSON Web Token for the App, signed with `key` through `openssl`.
 
     iat is backdated 60 seconds and exp set 540 seconds ahead, inside GitHub's ten-minute ceiling,
@@ -167,14 +197,40 @@ def sign_jwt(key, now=None):
         data = os.path.join(tmp, "signing-input")
         with open(data, "w") as f:
             f.write(signing_input)
-        r = subprocess.run(["openssl", "dgst", "-sha256", "-sign", "/dev/stdin", "-binary", data],
-                           input=key, capture_output=True)
+        r = subprocess.run([openssl, "dgst", "-sha256", "-sign", "/dev/stdin", "-binary", data],
+                           input=key, capture_output=True, env=OPENSSL_ENV)
     if r.returncode != 0 or not r.stdout:
         raise Refusal("openssl could not sign with the App key (exit %d); is it a PEM RSA "
                       "private key?" % r.returncode)
     token = "%s.%s" % (signing_input, b64url(r.stdout))
     SECRETS.append(token)
     return token
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the bearer elsewhere, or downgrade it; every one is refused."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Refusal("GitHub answered %s %s with a redirect (HTTP %d); redirects are refused"
+                      % (req.get_method(), urllib.parse.urlsplit(req.full_url).path, code))
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def check_api(api):
+    """The API base, refused unless it is https, or http to a loopback address (the selftest)."""
+    u = urllib.parse.urlsplit(api)
+    host = u.hostname or ""
+    if u.scheme == "https" and host:
+        return api
+    if u.scheme == "http":
+        try:
+            if host == "localhost" or ipaddress.ip_address(host).is_loopback:
+                return api
+        except ValueError:
+            pass
+    raise Refusal("the API address %s is neither https nor loopback" % api)
 
 
 def call(api, method, path, bearer, body=None):
@@ -189,7 +245,7 @@ def call(api, method, path, bearer, body=None):
     if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with OPENER.open(req, timeout=30) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -235,6 +291,8 @@ def exchange(api, jwt, profile):
     token = minted["token"]
     SECRETS.append(token)
     problems = []
+    if not TOKEN_SHAPE.fullmatch(token):
+        problems.append("the token is not 1 to 255 letters, digits and underscores")
     granted = minted.get("permissions")
     if not isinstance(granted, dict):
         problems.append("the answer names no permissions")
@@ -281,19 +339,39 @@ def prepare_out_dir(out_dir, uid):
                                                           mode_text(st)))
 
 
-def write_token(out_dir, profile, reader, token, expires):
-    """Write the token file atomically: mode 0400 and the reader's ownership are set on the
-    temporary file before a byte of the token goes in, then it replaces the old file."""
+def reader_group(group_name, reader):
+    """The group the token file belongs to, after checking that `reader` is in it and that no
+    other account is, as a listed member or by its primary group."""
+    try:
+        g = grp.getgrnam(group_name)
+    except KeyError:
+        raise Refusal("no group named %s on this host; docs/fuzz-token.md says how to make it"
+                      % group_name)
+    members = set(g.gr_mem) | {p.pw_name for p in pwd.getpwall() if p.pw_gid == g.gr_gid}
+    if reader.pw_name not in members:
+        raise Refusal("the account %s is not in the group %s" % (reader.pw_name, group_name))
+    others = sorted(members - {reader.pw_name})
+    if others:
+        raise Refusal("the group %s holds %s besides %s; the token's group must hold its reader "
+                      "alone" % (group_name, ", ".join(others), reader.pw_name))
+    return g
+
+
+def write_token(out_dir, profile, reader, group, token, expires):
+    """Write the token file atomically. Owner (the running user, root on the host), the reader's
+    group and mode 0440 are set on the temporary file before a byte of the token goes in, then it
+    replaces the old file. The reader can read it and cannot change it."""
     path = os.path.join(out_dir, profile + ".env")
-    body = ("# fuzz-token: the %s token, readable by %s alone. Rewritten every 20 minutes.\n"
-            "GH_TOKEN=%s\nGH_TOKEN_EXPIRES_AT=%s\nGH_TOKEN_PERMISSIONS=%s\n"
+    body = ("# fuzz-token: the %s token, readable by %s through the group %s. Rewritten every 20 "
+            "minutes.\nGH_TOKEN=%s\nGH_TOKEN_EXPIRES_AT=%s\nGH_TOKEN_PERMISSIONS=%s\n"
             "GH_TOKEN_REPOSITORIES=%s\n" % (
-                profile, reader.pw_name, token, expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                profile, reader.pw_name, group.gr_name, token,
+                expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 permissions_text(PROFILES[profile]["permissions"]), FULL_NAME))
     fd, tmp = tempfile.mkstemp(dir=out_dir, prefix="." + profile + ".")
     try:
+        os.fchown(fd, os.geteuid(), group.gr_gid)
         os.fchmod(fd, TOKEN_MODE)
-        os.fchown(fd, reader.pw_uid, reader.pw_gid)
         os.write(fd, body.encode())
         os.fsync(fd)
         os.close(fd)
@@ -341,16 +419,18 @@ def reader_account(name):
 
 def mint(args):
     profile = args.profile
+    api = check_api(args.api)
     reader = reader_account(args.reader or PROFILES[profile]["reader"])
+    group = reader_group(args.group or "fuzz-token-" + profile, reader)
     uid = os.geteuid()
     key = check_key(args.key, uid)
     prepare_out_dir(args.out_dir, uid)
-    jwt = sign_jwt(key)
+    jwt = sign_jwt(key, args.openssl)
     del key
-    token, expires = exchange(args.api, jwt, profile)
-    path = write_token(args.out_dir, profile, reader, token, expires)
-    print("fuzz-token: wrote %s for %s: %s on %s, expires %s" % (
-        path, reader.pw_name, permissions_text(PROFILES[profile]["permissions"]), FULL_NAME,
+    token, expires = exchange(api, jwt, profile)
+    path = write_token(args.out_dir, profile, reader, group, token, expires)
+    print("fuzz-token: wrote %s for %s (group %s): %s on %s, expires %s" % (
+        path, reader.pw_name, group.gr_name, permissions_text(PROFILES[profile]["permissions"]), FULL_NAME,
         expires.strftime("%Y-%m-%dT%H:%M:%SZ")))
     return 0
 
@@ -362,15 +442,19 @@ def check(args):
         owner = pwd.getpwuid(st.st_uid).pw_name
     except KeyError:
         owner = "uid %d" % st.st_uid
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = "gid %d" % st.st_gid
     expires = parse_expiry(fields.get("GH_TOKEN_EXPIRES_AT"))
     left = int((expires - datetime.now(timezone.utc)).total_seconds())
-    _, listing = call(args.api, "GET", "/installation/repositories?per_page=100",
+    _, listing = call(check_api(args.api), "GET", "/installation/repositories?per_page=100",
                       fields["GH_TOKEN"])
     repos = listing.get("repositories") if isinstance(listing, dict) else None
     names = sorted(r.get("full_name", "?") for r in repos if isinstance(r, dict)) \
         if isinstance(repos, list) else []
     print("profile: %s" % args.profile)
-    print("file: %s (owner %s, mode %s)" % (path, owner, mode_text(st)))
+    print("file: %s (owner %s, group %s, mode %s)" % (path, owner, group, mode_text(st)))
     print("permissions: %s" % fields.get("GH_TOKEN_PERMISSIONS", "unrecorded"))
     print("expires: %s (%s)" % (fields["GH_TOKEN_EXPIRES_AT"],
                                 "in %d minutes" % (left // 60) if left > 0 else "expired"))
@@ -382,6 +466,8 @@ def check(args):
         problems.append("the token has expired; is fuzz-token@%s.timer running?" % args.profile)
     if stat.S_IMODE(st.st_mode) != TOKEN_MODE:
         problems.append("the file's mode must be %04o" % TOKEN_MODE)
+    if st.st_uid != os.geteuid() and os.geteuid() == 0:
+        problems.append("the file must be owned by root")
     for p in problems:
         print("fuzz-token: %s" % p, file=sys.stderr)
     return 1 if problems else 0
@@ -389,8 +475,8 @@ def check(args):
 
 def profiles(_args):
     for name, p in sorted(PROFILES.items()):
-        print("%s\t%s\treader %s\t%s" % (name, permissions_text(p["permissions"]), p["reader"],
-                                          p["what"]))
+        print("%s\t%s\treader %s\tgroup fuzz-token-%s\t%s" % (
+            name, permissions_text(p["permissions"]), p["reader"], name, p["what"]))
     return 0
 
 
@@ -401,9 +487,11 @@ def main(argv):
     m = sub.add_parser("mint", help="mint a token and write it for the reader")
     m.add_argument("profile", choices=sorted(PROFILES))
     m.add_argument("--reader", help="the account that may read the token file")
+    m.add_argument("--group", help="the token file's group; it must hold the reader alone")
     m.add_argument("--key", default=DEFAULT_KEY)
     m.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     m.add_argument("--api", default=DEFAULT_API)
+    m.add_argument("--openssl", default=DEFAULT_OPENSSL)
     m.set_defaults(run=mint)
     c = sub.add_parser("check", help="print the token's repositories and expiry, never the token")
     c.add_argument("profile", choices=sorted(PROFILES))

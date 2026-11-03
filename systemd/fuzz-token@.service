@@ -13,19 +13,26 @@ After=network-online.target
 Type=oneshot
 User=root
 ExecStart=/usr/local/sbin/fuzz-token mint %i
+Environment=PATH=/usr/bin:/bin
+TimeoutStartSec=2min
+LimitCORE=0
 # /run/fuzz-token: root-owned, mode 0711, kept between runs so a reader's file survives each mint.
 RuntimeDirectory=fuzz-token
 RuntimeDirectoryMode=0711
 RuntimeDirectoryPreserve=yes
 UMask=0077
-# Root reads its own 0400 key through owner permission and needs only CAP_CHOWN, to hand the token
-# file to its reader.
+# Root reads its own 0400 key through owner permission and needs only CAP_CHOWN, to give the token
+# file the reader's group. A profile's reader and group change through a drop-in that replaces
+# ExecStart= (docs/fuzz-token.md).
 CapabilityBoundingSet=CAP_CHOWN
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+PrivateIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
