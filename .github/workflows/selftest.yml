@@ -1,0 +1,24 @@
+# Runs script/test on every pull request and merge group. The main ruleset requires the job
+# named `selftest`, so renaming the job means changing the ruleset in the same step.
+name: selftest
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  merge_group:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  selftest:
+    name: selftest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: tools
+        run: python3 --version && openssl version && shellcheck --version | head -2
+      - name: script/test
+        run: script/test

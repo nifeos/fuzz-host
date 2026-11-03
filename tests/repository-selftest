@@ -1,0 +1,27 @@
+#!/bin/sh
+# tests/repository-selftest: the files every repository here carries are present, and the shell
+# scripts pass shellcheck where it is installed.
+#
+# Name: provisional.
+
+set -u
+
+status=0
+for f in LICENSE-APACHE LICENSE-MIT README.md AGENTS.md SECURITY.md CODEOWNERS .gitignore \
+    .github/workflows/selftest.yml script/test; do
+    if [ ! -f "$f" ]; then
+        echo "repository-selftest: missing $f" >&2
+        status=1
+    fi
+done
+
+if command -v shellcheck >/dev/null 2>&1; then
+    if ! shellcheck script/test tests/repository-selftest; then
+        status=1
+    fi
+else
+    echo "repository-selftest: shellcheck is not installed; skipped it"
+fi
+
+[ "$status" -eq 0 ] && echo "repository-selftest: ok"
+exit "$status"
