@@ -1,0 +1,365 @@
+#!/usr/bin/python3 -I
+"""tests/fuzz-token-selftest: bin/fuzz-token against a throwaway key and a local stub of GitHub.
+
+No real key, no real token and no network: the test generates an RSA key with `openssl`, serves the
+two API calls the helper makes from a stub on 127.0.0.1, and puts a wrapper named `openssl` first on
+PATH that records every argument list before running the real binary. It checks:
+
+- the JSON Web Token's header and claims, and its signature, verified with `openssl` against the
+  throwaway key's public half, both by the stub and again here;
+- that the exchange asks for exactly one profile's permissions on nife alone;
+- the token file's content, owner and mode 0400, and the token directory's mode 0711;
+- that a key file or directory with the wrong mode, a key reached through a link, and a key with
+  the wrong owner are refused before any request;
+- that an answer granting more, or reaching another repository, is refused, revoked and not written;
+- that `check` prints the repositories and the expiry, never the token, and fails on a stale token or
+  a second repository;
+- that no output, no argument list and no file other than the key and the token file ever holds the
+  key or a token, including an error message built from a hostile answer.
+
+Name: provisional.
+"""
+
+import base64
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HELPER = os.path.join(ROOT, "bin", "fuzz-token")
+ME = os.geteuid()
+MY_NAME = __import__("pwd").getpwuid(ME).pw_name
+
+failures = []
+
+
+def check(name, ok, detail=""):
+    print("%s %s" % ("ok  " if ok else "FAIL", name))
+    if not ok:
+        failures.append(name)
+        if detail:
+            print("     " + str(detail)[:400])
+
+
+def unb64(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def main():
+    tmp = tempfile.mkdtemp(prefix="fuzz-token-selftest.")
+    os.chmod(tmp, 0o700)
+    servers = []
+    try:
+        return run(tmp, servers.append)
+    finally:
+        for s in servers:
+            s.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run(tmp, keep_server):
+    real_openssl = shutil.which("openssl")
+    if not real_openssl:
+        print("fuzz-token-selftest: openssl is not installed", file=sys.stderr)
+        return 1
+
+    # The throwaway key, in a directory shaped like the host's.
+    keydir = os.path.join(tmp, "etc-nife-fuzz")
+    os.mkdir(keydir, 0o700)
+    key = os.path.join(keydir, "key.pem")
+    pub = os.path.join(tmp, "pub.pem")
+    subprocess.run([real_openssl, "genpkey", "-algorithm", "RSA", "-pkeyopt",
+                    "rsa_keygen_bits:2048", "-out", key], check=True, capture_output=True)
+    subprocess.run([real_openssl, "pkey", "-in", key, "-pubout", "-out", pub], check=True,
+                   capture_output=True)
+    os.chmod(key, 0o400)
+    with open(key) as f:
+        key_lines = [l for l in f.read().splitlines() if l and not l.startswith("-----")]
+
+    # The openssl wrapper: records each argument list, then runs the real binary.
+    bindir = os.path.join(tmp, "bin")
+    os.mkdir(bindir)
+    argv_log = os.path.join(tmp, "openssl-argv.log")
+    with open(os.path.join(bindir, "openssl"), "w") as f:
+        f.write('#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n'
+                % (argv_log, real_openssl))
+    os.chmod(os.path.join(bindir, "openssl"), 0o755)
+
+    state = {"mode": "ok", "bodies": [], "jwts": [], "issued": [], "revoked": [],
+             "bad_jwt": 0, "repo_listing": ["nifeos/nife"]}
+
+    def verify_jwt(jwt):
+        parts = jwt.split(".")
+        if len(parts) != 3:
+            return None
+        data = os.path.join(tmp, "verify-data")
+        sig = os.path.join(tmp, "verify-sig")
+        with open(data, "w") as f:
+            f.write(parts[0] + "." + parts[1])
+        with open(sig, "wb") as f:
+            f.write(unb64(parts[2]))
+        r = subprocess.run([real_openssl, "dgst", "-sha256", "-verify", pub, "-signature", sig,
+                            data], capture_output=True)
+        os.unlink(data)
+        os.unlink(sig)
+        if r.returncode != 0:
+            return None
+        return json.loads(unb64(parts[0])), json.loads(unb64(parts[1]))
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, code, obj):
+            body = json.dumps(obj).encode() if obj is not None else b""
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def bearer(self):
+            a = self.headers.get("Authorization", "")
+            return a[7:] if a.startswith("Bearer ") else ""
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+            jwt = self.bearer()
+            state["jwts"].append(jwt)
+            if self.path != "/app/installations/177641059/access_tokens":
+                return self.reply(404, {"message": "Not Found"})
+            if state["mode"] == "hostile":
+                # An answer that echoes the credential back, as a careless proxy might.
+                return self.reply(401, {"message": "bad credentials: " + jwt})
+            if verify_jwt(jwt) is None:
+                state["bad_jwt"] += 1
+                return self.reply(401, {"message": "A JSON web token could not be decoded"})
+            state["bodies"].append(body)
+            token = "ghs_selftest%d_%s" % (len(state["issued"]), os.urandom(6).hex())
+            state["issued"].append(token)
+            perms = dict(body.get("permissions", {}), metadata="read")
+            repos = [{"full_name": "nifeos/" + r} for r in body.get("repositories", [])]
+            if state["mode"] == "wider":
+                perms["administration"] = "write"
+            if state["mode"] == "other-repo":
+                repos.append({"full_name": "nifeos/basalt"})
+            exp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+            self.reply(201, {"token": token, "expires_at": exp, "permissions": perms,
+                             "repositories": repos, "repository_selection": "selected"})
+
+        def do_DELETE(self):
+            if self.path == "/installation/token" and self.bearer() in state["issued"]:
+                state["revoked"].append(self.bearer())
+                return self.reply(204, None)
+            self.reply(401, {"message": "Bad credentials"})
+
+        def do_GET(self):
+            if not self.path.startswith("/installation/repositories"):
+                return self.reply(404, {"message": "Not Found"})
+            if self.bearer() not in state["issued"]:
+                return self.reply(401, {"message": "Bad credentials"})
+            self.reply(200, {"total_count": len(state["repo_listing"]),
+                             "repositories": [{"full_name": n} for n in state["repo_listing"]]})
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    keep_server(server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    api = "http://127.0.0.1:%d" % server.server_address[1]
+
+    out = os.path.join(tmp, "run-fuzz-token")
+    env = {k: v for k, v in os.environ.items() if "PROXY" not in k.upper()}
+    env.update({"PATH": bindir + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
+                "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1",
+                "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": tmp})
+    outputs = []
+
+    def helper(*args, key_path=key):
+        full = list(args)
+        if full[0] == "mint":
+            full += ["--reader", MY_NAME, "--key", key_path]
+        if full[0] in ("mint", "check"):
+            full += ["--out-dir", out, "--api", api]
+        r = subprocess.run([sys.executable, "-I", HELPER] + full, env=env, capture_output=True,
+                           text=True, cwd=tmp)
+        outputs.append(r.stdout + r.stderr)
+        return r
+
+    def token_file(profile):
+        return os.path.join(out, profile + ".env")
+
+    def fields(profile):
+        with open(token_file(profile)) as f:
+            return dict(l.split("=", 1) for l in f.read().splitlines()
+                        if l and not l.startswith("#"))
+
+    # 1. A clean mint for each profile.
+    r = helper("mint", "publish")
+    check("mint publish exits 0", r.returncode == 0, r.stderr)
+    check("the stub verified every JWT signature", state["bad_jwt"] == 0)
+    check("the exchange asks for contents write on nife alone",
+          state["bodies"][-1:] == [{"repositories": ["nife"], "permissions": {"contents": "write"}}],
+          state["bodies"])
+    jwt = state["jwts"][-1] if state["jwts"] else ""
+    parts = jwt.split(".")
+    check("the JWT has three parts", len(parts) == 3, jwt[:40])
+    verified = verify_jwt(jwt)
+    check("the JWT verifies against the throwaway key's public half", verified is not None)
+    if verified:
+        header, claims = verified
+        now = time.time()
+        check("the JWT header is RS256", header == {"alg": "RS256", "typ": "JWT"}, header)
+        check("the JWT names App 5571801", claims.get("iss") == "5571801", claims)
+        check("the JWT lives at most ten minutes",
+              claims.get("exp", 0) - claims.get("iat", 0) == 600 and
+              claims["iat"] <= now and claims["exp"] <= now + 600, claims)
+        check("the JWT holds only iat, exp and iss", sorted(claims) == ["exp", "iat", "iss"],
+              claims)
+    st = os.lstat(token_file("publish")) if os.path.exists(token_file("publish")) else None
+    check("the token file exists", st is not None)
+    if st:
+        check("the token file is mode 0400", stat.S_IMODE(st.st_mode) == 0o400, oct(st.st_mode))
+        check("the token file belongs to the reader", st.st_uid == ME)
+        f = fields("publish")
+        check("the token file holds the issued token", f.get("GH_TOKEN") == state["issued"][-1])
+        check("the token file records permissions and repository",
+              f.get("GH_TOKEN_PERMISSIONS") == "contents:write" and
+              f.get("GH_TOKEN_REPOSITORIES") == "nifeos/nife", f)
+    check("the token directory is mode 0711",
+          stat.S_IMODE(os.lstat(out).st_mode) == 0o711, oct(os.lstat(out).st_mode))
+    check("mint prints the path and expiry", "publish.env" in r.stdout and "expires" in r.stdout,
+          r.stdout)
+    leftovers = [n for n in os.listdir(out) if n.startswith(".")]
+    check("no temporary token file is left behind", not leftovers, leftovers)
+
+    r = helper("mint", "filer")
+    check("mint filer exits 0", r.returncode == 0, r.stderr)
+    check("the filer asks for repository advisories write alone",
+          state["bodies"][-1:] == [{"repositories": ["nife"],
+                                    "permissions": {"repository_advisories": "write"}}],
+          state["bodies"][-1:])
+
+    # 2. A second mint replaces the token in place.
+    first = fields("publish")["GH_TOKEN"]
+    r = helper("mint", "publish")
+    check("a second mint replaces the token", r.returncode == 0 and
+          fields("publish")["GH_TOKEN"] not in ("", first), r.stderr)
+
+    # 3. check.
+    r = helper("check", "publish")
+    check("check exits 0 on a fresh token", r.returncode == 0, r.stdout + r.stderr)
+    check("check prints exactly nifeos/nife", "repositories: nifeos/nife\n" in r.stdout, r.stdout)
+    check("check prints the expiry", "expires: " in r.stdout and "minutes" in r.stdout, r.stdout)
+    state["repo_listing"] = ["nifeos/nife", "nifeos/basalt"]
+    r = helper("check", "publish")
+    check("check fails when the token reaches a second repository", r.returncode == 1, r.stdout)
+    state["repo_listing"] = ["nifeos/nife"]
+    stale = token_file("filer")
+    body = open(stale).read()
+    os.chmod(stale, 0o600)
+    with open(stale, "w") as f:
+        f.write("\n".join(l if not l.startswith("GH_TOKEN_EXPIRES_AT=")
+                          else "GH_TOKEN_EXPIRES_AT=2026-01-01T00:00:00Z"
+                          for l in body.splitlines()) + "\n")
+    os.chmod(stale, 0o400)
+    r = helper("check", "filer")
+    check("check fails on an expired token", r.returncode == 1 and "expired" in r.stdout + r.stderr,
+          r.stdout + r.stderr)
+
+    # 4. Refusals before any request.
+    requests_before = len(state["jwts"])
+    for mode in (0o440, 0o444, 0o600, 0o500):
+        os.chmod(key, mode)
+        r = helper("mint", "publish")
+        check("a key file with mode %04o is refused" % mode,
+              r.returncode == 3 and "%04o" % mode in r.stderr, r.stderr)
+    os.chmod(key, 0o400)
+    os.chmod(keydir, 0o750)
+    r = helper("mint", "publish")
+    check("a key directory with mode 0750 is refused", r.returncode == 3 and "0750" in r.stderr,
+          r.stderr)
+    os.chmod(keydir, 0o700)
+    link = os.path.join(keydir, "link.pem")
+    os.symlink(key, link)
+    r = helper("mint", "publish", key_path=link)
+    check("a key reached through a link is refused", r.returncode == 3 and "link" in r.stderr,
+          r.stderr)
+    os.unlink(link)
+    check("no refused key reached the API", len(state["jwts"]) == requests_before,
+          len(state["jwts"]) - requests_before)
+
+    loader = importlib.machinery.SourceFileLoader("fuzz_token", HELPER)
+    spec = importlib.util.spec_from_loader("fuzz_token", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    try:
+        mod.check_key(key, ME + 1)
+        refused, msg = False, ""
+    except mod.Refusal as e:
+        refused, msg = True, str(e)
+    check("a key file owned by another account is refused",
+          refused and "uid %d" % (ME + 1) in msg, msg)
+    check("the key check returns the key for the right owner",
+          mod.check_key(key, ME).startswith(b"-----BEGIN"))
+
+    # 5. Answers that grant too much.
+    for mode, word in (("wider", "administration"), ("other-repo", "nifeos/basalt")):
+        if os.path.exists(token_file("publish")):
+            os.unlink(token_file("publish"))
+        state["mode"] = mode
+        r = helper("mint", "publish")
+        check("an answer that is %s is refused" % mode, r.returncode == 3 and word in r.stderr,
+              r.stderr)
+        check("the %s token is revoked" % mode, state["issued"][-1] in state["revoked"])
+        check("the %s token is not written" % mode, not os.path.exists(token_file("publish")))
+    state["mode"] = "hostile"
+    r = helper("mint", "publish")
+    check("a hostile error answer is refused", r.returncode == 3 and "401" in r.stderr, r.stderr)
+    check("the hostile answer's echo of the JWT is redacted", "[redacted]" in r.stderr and
+          state["jwts"][-1] not in r.stderr, r.stderr)
+    state["mode"] = "ok"
+
+    r = helper("mint", "nonesuch")
+    check("an unknown profile is refused", r.returncode != 0, r.stderr)
+    r = helper("profiles")
+    check("profiles lists both", "publish" in r.stdout and "filer" in r.stdout, r.stdout)
+
+    # 6. Nothing holds a secret where it should not.
+    secrets = state["issued"] + [j for j in state["jwts"] if j]
+    every_output = "\n".join(outputs)
+    check("no output holds a token or a JWT", not any(s in every_output for s in secrets))
+    check("no output holds a line of the key", not any(l in every_output for l in key_lines))
+    argv_text = open(argv_log).read() if os.path.exists(argv_log) else ""
+    check("openssl ran", "dgst -sha256 -sign /dev/stdin" in argv_text, argv_text[:200])
+    check("no argument list holds the key, a token or a JWT",
+          not any(s in argv_text for s in secrets + key_lines))
+    allowed = {os.path.realpath(key), os.path.realpath(token_file("publish")),
+               os.path.realpath(token_file("filer"))}
+    for dirpath, _, names in os.walk(tmp):
+        for n in names:
+            p = os.path.realpath(os.path.join(dirpath, n))
+            if p in allowed or not os.path.isfile(p):
+                continue
+            with open(p, "rb") as f:
+                data = f.read().decode(errors="replace")
+            leaked = [s for s in secrets + key_lines if s in data]
+            check("%s holds no secret" % os.path.relpath(p, tmp), not leaked)
+
+    if failures:
+        print("fuzz-token-selftest: %d failed" % len(failures), file=sys.stderr)
+        return 1
+    print("fuzz-token-selftest: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

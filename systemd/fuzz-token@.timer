@@ -1,0 +1,14 @@
+# Rerun fuzz-token@<profile>.service a minute after boot and every 20 minutes after that. A token
+# lives 60 minutes, so its reader always holds one with at least 40 minutes left, and two failed
+# runs in a row still leave a valid token.
+# Name: provisional.
+[Unit]
+Description=Mint the nife-fuzz %i token every 20 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=20min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

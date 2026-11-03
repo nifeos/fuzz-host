@@ -1,0 +1,42 @@
+# Mint the nife-fuzz App's installation token for one service; the instance names the profile
+# (fuzz-token@publish.service, fuzz-token@filer.service). fuzz-token@.timer reruns it every 20
+# minutes. It runs as root because only root reads the App key, and it runs the root-owned copy in
+# /usr/local/sbin, never a file in a clone. See docs/fuzz-token.md.
+# Name: provisional.
+[Unit]
+Description=Mint the nife-fuzz %i token
+Documentation=https://github.com/nifeos/fuzz-host/blob/main/docs/fuzz-token.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/fuzz-token mint %i
+# /run/fuzz-token: root-owned, mode 0711, kept between runs so a reader's file survives each mint.
+RuntimeDirectory=fuzz-token
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+UMask=0077
+# Root reads its own 0400 key through owner permission and needs only CAP_CHOWN, to hand the token
+# file to its reader.
+CapabilityBoundingSet=CAP_CHOWN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
