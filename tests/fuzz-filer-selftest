@@ -211,6 +211,16 @@ DECOY_PORT = DECOY.server_address[1]
 API = "http://127.0.0.1:%d" % SERVER.server_address[1]
 
 
+def shape_checks():
+    for name, tok in (("classic", "ghs_" + "aB3_" * 9), ("long", "ghs_5571801_" + "eyJ-a_b" * 72 + ".x.y"),
+                      ("dotted", "ghs_1.2.3"), ("hyphenated", "ghs_a-b")):
+        check("the filer's shape check accepts a %s token" % name, bool(MOD.TOKEN_SHAPE.fullmatch(tok)))
+    for name, tok in (("empty", ""), ("spaced", "ghs_a b"), ("newline", "ghs_a\nb"),
+                      ("quoted", 'ghs_a"b'), ("dollar", "ghs_a$b"), ("leading-hyphen", "-ab"),
+                      ("over-long", "a" * 1025)):
+        check("the filer's shape check rejects a %s token" % name, not MOD.TOKEN_SHAPE.fullmatch(tok))
+
+
 def write_token(path, perms="repository_advisories:write", repos="nifeos/nife", minutes=50,
                 mode=0o440):
     if os.path.lexists(path):
@@ -318,6 +328,7 @@ def main():
 def run_tests(tmp):
     MOD.TOKEN_OWNER_UID = os.geteuid()
 
+    shape_checks()
     # 1. Three held windows, one per class: three creates, each well formed.
     env = Env(os.path.join(tmp, "a"))
     STUB.reset()

@@ -108,9 +108,15 @@ DEFAULT_OPENSSL = "/usr/bin/openssl"
 INSTALLED = "/usr/local/sbin/fuzz-token"
 # openssl runs with this PATH and nothing else in its environment.
 OPENSSL_ENV = {"PATH": "/usr/bin:/bin"}
-# What GitHub's installation tokens look like today (ghs_ and 36 characters); anything else is
-# refused rather than written into a file systemd parses.
-TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_]{1,255}")
+# What GitHub's installation tokens look like: ghs_ and 36 characters until 2026, now ghs_APPID_JWT
+# of about 520 characters with two dots (a JWT is base64url, so letters, digits, "_" and "-", and
+# "." between parts). GitHub says to treat them as opaque strings and not to assume a length. The
+# token only ever goes into a file systemd parses, an Authorization header or an environment
+# variable, so this check is not GitHub's format: it refuses what could break out of those places
+# (empty, whitespace, newlines, control characters, quotes, "$", ";", backticks, a leading "-" that
+# a command line would read as an option) and anything absurdly long. "=", "+" and "/" are left
+# out because no documented format uses them; allowing them later would be compatible.
+TOKEN_SHAPE = re.compile(r"(?!-)[A-Za-z0-9_.-]{1,1024}")
 
 # The two Apps. Neither id is secret. Each key path is a root-only file on the one machine that
 # holds that App's key: nife-fuzz on the fuzz host, nife-fuzz-reader on the machine that launches
@@ -358,7 +364,7 @@ def exchange(api, jwt, profile):
     SECRETS.append(token)
     problems = []
     if not TOKEN_SHAPE.fullmatch(token):
-        problems.append("the token is not 1 to 255 letters, digits and underscores")
+        problems.append("the token is not 1 to 1024 letters, digits, underscores, hyphens and dots, or it starts with a hyphen")
     granted = minted.get("permissions")
     if not isinstance(granted, dict):
         problems.append("the answer names no permissions")
