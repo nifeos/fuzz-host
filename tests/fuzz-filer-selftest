@@ -22,6 +22,11 @@ a stub on 127.0.0.1. It checks:
 - that a redirect is refused and the redirect target hears nothing;
 - that a create answered without a package and range is recorded (never filed twice) and reported;
 - that --dry-run sends nothing; that a ledger of the wrong mode or a held lock is refused;
+- cause dedupe (section 17): logs that differ only in seeds, timings, numbers, line numbers and
+  build lines share one signature and one advisory, filed for the oldest; a different message, file,
+  class or driver is a separate signature; the ledger keeps a count and the newest commit; a ledger
+  from before signatures still reads and refiles nothing; a signature already in the ledger is not
+  refiled, even after its first log is gone; the cap of 10 a run holds;
 - that nothing the filer printed in any of these runs, and nothing in its ledger, holds a planted
   seed, a held log's name, a replay line or the token, even when GitHub's error message echoes them.
 
@@ -396,7 +401,8 @@ def run_tests(tmp):
     STUB.mode = "drop-after-create"
     code, text = env.run()
     check("a create whose answer breaks off exits 1 and leaves the finding pending",
-          code == 1 and env.ledger_text().rstrip().endswith("\tpending\t-"), (code, text))
+          code == 1 and "\tpending\t-\t" in env.ledger_text().rstrip().splitlines()[-1],
+          (code, text))
     STUB.mode = "ok"
     STUB.requests = []
     code, text = env.run()
@@ -598,6 +604,220 @@ def run_tests(tmp):
     outputs.append(out.getvalue())
     check("ledger prints four filed findings", out.getvalue().count("\tfiled\tGHSA-") == 4,
           out.getvalue())
+
+    # 17. Cause dedupe. Synthetic logs only: every message, file and seed below is invented.
+    seeds17 = []
+
+    def panic_log(first, seed, text, file="system_tests/src/user/invented_tests.rs", line=900,
+                  driver="kernel-thread", build=0):
+        seeds17.extend([first, seed])
+        variable = "NIFE_SYSCALL_FUZZ_SEEDS" if driver == "kernel-thread" else \
+            "NIFE_CONFINED_FUZZ_SEEDS"
+        return [
+            "continuous-fuzz: slot 0: %s, seeds from %s, accelerator kvm, image x" % (driver, first),
+            "build: compiled %d crates in %d.%d s" % (100 + build, build, build * 7),
+            "[PANIC] panicked at %s:%d:%d:" % (file, line, 5 + build),
+            text % {"hex": "0x%x" % (0xabc0 + build * 977), "n": 3 + build * 11,
+                    "ms": 40 + build * 13, "list": ", ".join(str(build + k) for k in range(3))}
+            + " (replay: %s=%s:1)" % (variable, seed),
+        ]
+
+    base = ("fuzzer: seed %(hex)s step %(n)d: invented mismatch of slots [%(list)s] after "
+            "%(ms)d ms")
+
+    def mini(name, specs):
+        """An Env-like directory holding only the held logs `specs` describe, oldest first:
+        (first seed, driver, class, commit, log lines)."""
+        e = Env.__new__(Env)
+        e.tmp = os.path.join(tmp, name)
+        e.home = os.path.join(e.tmp, "fuzz")
+        e.held = os.path.join(e.home, "state", "held")
+        os.makedirs(e.held)
+        os.chmod(e.held, 0o700)
+        e.statedir = os.path.join(e.tmp, "var-lib-fuzz-filer")
+        os.mkdir(e.statedir, 0o700)
+        e.ledger = os.path.join(e.statedir, "ledger.tsv")
+        e.token = os.path.join(e.tmp, "filer.env")
+        write_token(e.token)
+        e.names = []
+        e.fids = []
+        e.add(specs)
+        return e
+
+    def add(e, specs):
+        base_time = 1_700_000_000 + len(e.names) * 1000
+        with open(os.path.join(e.home, "state", "windows.tsv"), "a") as w:
+            for k, (first, driver, status, commit, lines) in enumerate(specs):
+                w.write("\t".join(("2026-11-03T01:00:00Z", driver, "0", first, "1", "61000",
+                                   status, commit)) + "\n")
+                name = held_log(e.held, first, lines)
+                path = os.path.join(e.held, name)
+                os.utime(path, (base_time + k * 10, base_time + k * 10))
+                e.names.append(name)
+                with open(path, "rb") as f:
+                    e.fids.append(__import__("hashlib").sha256(f.read()).hexdigest()[:16])
+
+    Env.add = add
+
+    def finding(first, driver="kernel-thread", commit="aaa1111", text=base, **kw):
+        seed = str(int(first) + 5 + kw.get("build", 0))
+        return (first, driver, "held-finding", commit, panic_log(first, seed, text, driver=driver,
+                                                                   **kw))
+
+    # Logs of one cause differ in seeds, timings, numbers, line numbers and build lines.
+    cause_logs = [finding("7392%07d" % (k * 100), commit="aaa%04d" % k, line=900 + k * 17, build=k)
+                  for k in range(5)]
+    a = mini("s1", cause_logs)
+    STUB.reset()
+    code, text = a.run("--dry-run")
+    check("a dry run names one finding for five logs of one cause",
+          code == 0 and text.count("would file finding") == 1 and "(5 held logs)" in text and
+          STUB.requests == [], (code, text))
+    code, text = a.run()
+    check("five logs that differ in seeds, timings, numbers and line numbers file one advisory",
+          code == 0 and len(creates()) == 1 and len(STUB.advisories) == 1, (code, text))
+    check("the advisory is for the oldest log",
+          "- Finding: %s" % a.fids[0] in STUB.advisories[0]["description"] and
+          "aaa0000" in STUB.advisories[0]["description"], STUB.advisories[0]["description"])
+    led = a.ledger_text()
+    check("the ledger counts the four later logs and keeps the newest commit",
+          led.count("\tcause\t") == 1 and "\t4\taaa0004" in led and led.count("\tfiled\t") == 1,
+          led)
+    check("the filed line carries a signature of 12 hexadecimal digits",
+          bool(__import__("re").search(r"\tfiled\tGHSA-[^\t]+\t[0-9a-f]{12}\n", led)), led)
+    check("the run's output names counts and signature short forms and no message or file",
+          "cause " in text and "5 held logs" in text and "invented" not in text and
+          "_tests.rs" not in text and "mismatch" not in text, text)
+
+    # A second run files nothing and sends nothing; the ledger does not grow.
+    before = a.ledger_text()
+    STUB.requests = []
+    code, text = a.run()
+    check("a second run files nothing, sends nothing and writes nothing",
+          code == 0 and STUB.requests == [] and a.ledger_text() == before, (code, text))
+
+    # A later log of the same cause, at a newer commit, is counted and not filed.
+    a.add([finding("7392%07d" % 900, commit="bbb2222", line=1234, build=9)])
+    STUB.requests = []
+    code, text = a.run()
+    check("a later log of a filed cause is not filed and sends nothing",
+          code == 0 and STUB.requests == [] and len(STUB.advisories) == 1, (code, text))
+    check("its count and newest commit are recorded",
+          a.ledger_text().rstrip().splitlines()[-1].endswith("\t5\tbbb2222"), a.ledger_text())
+
+    # Separate signatures: another message, another file, another class, another driver.
+    other_class = finding("7393%07d" % 0, text=base)
+    other_class = (other_class[0], other_class[1], "held-crash", other_class[3], other_class[4])
+    b = mini("s2", [
+        finding("7393%07d" % 100),
+        finding("7393%07d" % 200, text="fuzzer: seed %(hex)s step %(n)d: invented overflow of "
+                                         "slots [%(list)s] after %(ms)d ms"),
+        finding("7393%07d" % 300, file="system_tests/src/user/another_invented_tests.rs"),
+        (other_class[0], other_class[1], other_class[2], other_class[3], other_class[4]),
+        finding("7393%07d" % 400, driver="confined"),
+        finding("7393%07d" % 500, line=1, build=3),
+    ])
+    STUB.reset()
+    code, text = b.run()
+    check("a different message, file, class and driver each file their own advisory, and the "
+          "sixth log, a repeat of the first, does not", code == 0 and len(creates()) == 5, (code, text))
+
+    # Normalization itself.
+    t = MOD.template_of
+    check("hex, decimal, bracketed lists and the replay suffix are normalized",
+          t("seed 0x1f step 3: bad [1, 2] at 12.5 ms (replay: NIFE_X_SEEDS=9:1)") ==
+          t("seed 0xABC step 77: bad [] at 3 ms (replay: NIFE_X_SEEDS=1234:1)"))
+    check("a number inside a word stays", t("u64 overflow") != t("u32 overflow"))
+    sig = MOD.signature_of
+    c1 = MOD.cause_of(b"[PANIC] panicked at a/b.rs:10:5:\n", b"boom 3\n", None)
+    c2 = MOD.cause_of(b"[PANIC] panicked at a/b.rs:99:1:\n", b"boom 400\n", None)
+    c3 = MOD.cause_of(b"[PANIC] panicked at a/c.rs:10:5:\n", b"boom 3\n", None)
+    c4 = MOD.cause_of(b"[PANIC] panicked at a/b.rs:10:5:\n", b"bang 3\n", None)
+    check("line-number drift does not split a signature, a file or message does",
+          sig("d", "held-crash", c1) == sig("d", "held-crash", c2) and
+          sig("d", "held-crash", c1) != sig("d", "held-crash", c3) and
+          sig("d", "held-crash", c1) != sig("d", "held-crash", c4) and
+          sig("d", "held-crash", c1) != sig("d", "held-hang", c1) and
+          sig("d", "held-crash", c1) != sig("e", "held-crash", c1))
+    check("a panic in the older single-line form parses to the same cause",
+          MOD.cause_of(b"thread 'x' panicked at 'boom 5', a/b.rs:3:9\n", None, None) == c1)
+
+    # An old-format ledger (four fields, no signature, no cause line) still reads and refiles
+    # nothing: each filed finding covers its own log's cause.
+    old = mini("s3", cause_logs[:3])
+    stamp = "2026-11-03T05:00:00Z"
+    with open(old.ledger, "w") as f:
+        f.write("# written before signatures\n%s\t%s\tfiled\tGHSA-2222-3333-4444\n"
+                % (stamp, old.fids[0]))
+    os.chmod(old.ledger, 0o600)
+    check("a four-field ledger still loads",
+          MOD.ledger_state(old.ledger_text())[old.fids[0]][:2] == ("filed", "GHSA-2222-3333-4444"))
+    STUB.reset()
+    code, text = old.run()
+    check("an old-format ledger's filed finding covers its cause: nothing is filed or sent",
+          code == 0 and STUB.requests == [] and creates() == [], (code, text))
+    check("the old line is kept and a cause line is added",
+          old.ledger_text().startswith("# written before signatures") and
+          old.ledger_text().count("\tcause\t") == 1 and
+          "\t2\taaa0002" in old.ledger_text(), old.ledger_text())
+    code, _ = old.run()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        MOD.main(["ledger", "--ledger", old.ledger])
+    outputs.append(out.getvalue())
+    check("the ledger command prints the cause line", "later logs" in out.getvalue() and
+          "\tfiled\tGHSA-2222-3333-4444" in out.getvalue(), out.getvalue())
+    with open(old.ledger, "a") as f:
+        f.write("%s\t%s\tfiled\tGHSA-2222-3333-4444\tnot-a-signature\n" % (stamp, old.fids[1]))
+    code, text = old.run()
+    check("a ledger line with a malformed signature is refused", code == 3, (code, text))
+
+    # A signature already in the ledger is not refiled, even when its first log is gone.
+    keep = mini("s4", cause_logs[:2])
+    STUB.reset()
+    code, text = keep.run()
+    check("the cause is filed once", code == 0 and len(creates()) == 1, (code, text))
+    with open(keep.ledger) as f:
+        causes_only = [l for l in f.read().splitlines() if "\tcause\t" in l]
+    for n in keep.names:
+        os.unlink(os.path.join(keep.held, n))
+    with open(keep.ledger, "w") as f:
+        f.write("\n".join(causes_only) + "\n")
+    keep.add([finding("7394%07d" % 0, commit="ccc3333", line=5, build=4)])
+    STUB.requests = []
+    code, text = keep.run()
+    check("a new log of a signature only the ledger knows is not refiled",
+          code == 0 and STUB.requests == [] and len(STUB.advisories) == 1, (code, text))
+
+    # A lost ledger: the listing covers the cause, and a duplicate is still not filed.
+    os.unlink(a.ledger)
+    STUB.reset()
+    STUB.advisories = [{"ghsa_id": "GHSA-2222-3333-4444",
+                        "description": "- Finding: %s\n" % a.fids[0]}]
+    code, text = a.run()
+    check("with the ledger lost, an advisory for one log covers the cause",
+          code == 0 and creates() == [] and "\tcause\t" in a.ledger_text() and
+          "\t5\tbbb2222" in a.ledger_text() and a.ledger_text().count("\tfiled\t") == 1,
+          (code, text, a.ledger_text()))
+
+    # The cap of ten holds across causes.
+    many = mini("s5", [finding("7395%07d" % (k * 10),
+                               text="fuzzer: invented failure kind-%s here" % "abcdefghijkl"[k])
+                       for k in range(12)])
+    STUB.reset()
+    code, text = many.run()
+    check("twelve causes file ten a run and two wait", len(creates()) == 10 and
+          "2 findings wait for the next run" in text, (code, text))
+    code, text = many.run()
+    check("the next run files the last two", len(creates()) == 12 and code == 0, (code, text))
+
+    planted17 = seeds17 + ["invented", "_tests.rs", "mismatch", "overflow", "kind-a"]
+    for e in (a, b, old, keep, many):
+        outputs.append(e.ledger_text())
+        planted17 += e.names
+    leaks = sorted({p for p in planted17 for o in outputs if p in o})
+    check("no output or ledger holds a seed, a log name, a message or a source file", not leaks,
+          leaks)
 
     # 16. Nothing printed, and no ledger, holds a seed, a held log's name, a replay line or the
     # token.

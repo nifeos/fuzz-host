@@ -11,11 +11,25 @@ log that has none yet. It is a plain program, not an agent and not a language mo
 
 - A finding is one held log, named by its content: the first 16 hexadecimal digits of the SHA-256
   of the log's bytes. The same log under two names is one finding.
+- Many held logs share one cause: every log differs in its seed, its timings and its build lines,
+  but a driver that trips the same check at the same place prints the same panic. Each log has a
+  signature, the driver, the class, the panic's source file without its line number, and the
+  panic's message with the `(replay: ...)` suffix removed and every hexadecimal number, decimal
+  number and bracketed list replaced by a placeholder; its short form is the first 12 hexadecimal
+  digits of the SHA-256 of those four fields. One advisory is filed per signature, for the oldest
+  held log of it. Later logs with the same signature are not filed; the ledger keeps a count of them
+  and the newest commit. A log with no panic line falls back to its first line that names a panic
+  or carries a replay command, and a hang, which has neither, is one signature per driver.
 - The ledger (`/var/lib/fuzz-filer/ledger.tsv`, owned by the account the filer runs as, mode 0600)
   records each finding as `pending` before the create call and `filed` with the advisory id after
-  it. A finding whose last line is `filed` is never filed again.
+  it, with the signature's short form as a fifth field, and one `cause` line per signature (its
+  advisory, how many later logs share it, the newest commit). A finding whose last line is `filed`
+  is never filed again, and neither is a signature the ledger or an advisory already covers. A
+  ledger from before signatures, whose lines have four fields, still reads: its filed findings
+  cover their own logs' signatures.
 - Before it creates anything, it lists the repository's advisories once and reads the `Finding:`
-  line of each. A finding already on GitHub is recorded as filed and not created again, which covers
+  line of each. A finding already on GitHub is recorded as filed and not created again, and its
+  signature is covered, which covers
   a run that died between the create and the ledger line, and a lost ledger. A failed listing files
   nothing.
 - Each advisory names the package `nife` in the ecosystem `other` and a `vulnerable_version_range`
@@ -23,7 +37,7 @@ log that has none yet. It is a plain program, not an agent and not a language mo
   known when a finding is filed. GitHub refuses to publish an advisory without a package and range.
 - The advisory's description holds the class, the driver, the commit, the seed (or, for a crash or
   a hang, the window's first seed and count) and the one-line replay command. Its summary holds the
-  finding id and the class and no seed.
+  finding id and the class and no seed. It never holds the signature or the panic.
 
 It reads the `filer` token that `fuzz-token` writes (`/run/fuzz-token/filer.env`) and never the App
 key. It refuses, before it opens the held directory, a token file that is a link, is not owned by
@@ -31,9 +45,9 @@ root, has a mode other than 0440, has a group other than `fuzz-token-filer`, rec
 other than `repository_advisories:write` or repositories other than `nifeos/nife`, or expires in
 less than 10 minutes.
 
-It never writes a seed, an input, a held log's name or an advisory body to standard output,
-standard error, the journal or the ledger. Its lines name finding ids, ages, advisory ids, counts
-and HTTP statuses. Every message, GitHub's included, passes through a filter that replaces each seed,
+It never writes a seed, an input, a held log's name, a panic message or file, a signature's fields
+or an advisory body to standard output, standard error, the journal or the ledger. Its lines name
+finding ids, signature short forms, ages, advisory ids, counts and HTTP statuses. Every message, GitHub's included, passes through a filter that replaces each seed,
 held log name and token it has seen.
 
 Rate: it files at most `--max` advisories a run (default 10), one a second, and stops the run when
@@ -41,7 +55,8 @@ GitHub reports fewer than 100 requests left this hour, or answers 403 or 429 for
 then exits 75 and the next run continues. It follows only `next` links back to the same listing.
 
 `--dry-run` checks the token, reads the findings and prints what it would file, by id and age, and
-sends nothing. `ledger` prints the ledger's ids, states, advisory ids and ages.
+sends nothing. `ledger` prints the ledger's ids, states, advisory ids and ages, and each cause's advisory, count
+and newest commit.
 
 Exit status: 0 when every finding is filed, 1 when anything was refused (each refusal is a journal
 line naming the finding id and age), 75 when a rate limit stopped the run, 3 on a refusal of the
@@ -130,8 +145,18 @@ WINDOW_SEEDS = 1000000
 
 PACKAGE = {"ecosystem": "other", "name": "nife"}
 FINDING_ID = re.compile(r"^[0-9a-f]{16}$")
+SIGNATURE_ID = re.compile(r"^[0-9a-f]{12}$")
 FINDING_LINE = re.compile(r"^- Finding: ([0-9a-f]{16})$", re.MULTILINE)
 GHSA_ID = re.compile(r"^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$")
+
+# A panic line, in the current form (`panicked at FILE:L:C:` then the message on the next line) or
+# the older one (`panicked at 'MESSAGE', FILE:L:C`).
+PANIC_AT = re.compile(r"panicked at (?:'(.*)', )?([^\s:']+):[0-9]+(?::[0-9]+)?:?\s*(.*)$")
+REPLAY_SUFFIX = re.compile(r"\s*\(replay:[^)]*\)")
+BRACKETED = re.compile(r"\[[^\]]*\]")
+HEX_NUMBER = re.compile(r"\b0[xX][0-9a-fA-F]+\b")
+DECIMAL_NUMBER = re.compile(r"(?<![A-Za-z_<])[0-9]+(?:\.[0-9]+)?")
+MAX_LINE = 4096
 
 # Every string that must never be printed: the token, each seed, each held log's name.
 SECRETS = []
@@ -391,7 +416,7 @@ def next_link(header, api):
 # The ledger: an agreement with the programs that read it, held in this code (ledger_state).
 
 def open_ledger(path):
-    """(fd of the lock, ledger state). Creates the ledger mode 0600 in a 0700 directory owned by
+    """(fd of the lock, fd of the ledger, ledger_parse's result). Creates the ledger mode 0600 in a 0700 directory owned by
     this account, refuses any other shape, and holds an exclusive lock for the run."""
     d = os.path.dirname(path) or "."
     try:
@@ -430,7 +455,7 @@ def open_ledger(path):
             if not b:
                 break
             chunks.append(b)
-        state = ledger_state(b"".join(chunks).decode(errors="replace"))
+        state = ledger_parse(b"".join(chunks).decode(errors="replace"))
     except Refusal:
         os.close(fd)
         os.close(lock)
@@ -438,28 +463,59 @@ def open_ledger(path):
     return lock, fd, state
 
 
-def ledger_state(text):
-    """{finding id: (state, advisory id or None, utc)} from the ledger's text, the last line of each
-    finding winning. A line is `utc<TAB>finding<TAB>pending|filed<TAB>advisory id or -`; lines
-    starting with # are comments. Any other line refuses the whole ledger."""
-    state = {}
+def ledger_parse(text):
+    """(state, causes, sigs) from the ledger's text.
+
+    state: {finding id: (state, advisory id or None, utc)}, the last line of each finding winning.
+    causes: {signature: (advisory id, later logs, newest commit)}, the last line of each winning.
+    sigs: {finding id: signature} for the findings whose line carries one.
+
+    A finding line is `utc<TAB>finding<TAB>pending|filed<TAB>advisory id or -`, with an optional
+    fifth field, the signature's short form (a line from before signatures has none). A cause line
+    is `utc<TAB>signature<TAB>cause<TAB>advisory id<TAB>count<TAB>commit`. Lines starting with # are
+    comments. Any other line refuses the whole ledger."""
+    state, causes, sigs = {}, {}, {}
     for n, line in enumerate(text.splitlines(), 1):
         if not line or line.startswith("#"):
             continue
         parts = line.split("\t")
-        ok = len(parts) == 4 and FINDING_ID.match(parts[1]) and (
+        if len(parts) == 6 and parts[2] == "cause":
+            ok = (SIGNATURE_ID.match(parts[1]) and GHSA_ID.match(parts[3]) and
+                  parts[4].isdigit() and re.fullmatch(r"[0-9a-f]{7,40}", parts[5]))
+            if not ok:
+                raise Refusal("the ledger's line %d is not a ledger line; nothing is filed until a "
+                              "person mends it" % n)
+            parse_utc(parts[0])
+            causes[parts[1]] = (parts[3], int(parts[4]), parts[5])
+            continue
+        ok = len(parts) in (4, 5) and FINDING_ID.match(parts[1]) and (
             (parts[2] == "pending" and parts[3] == "-") or
-            (parts[2] == "filed" and GHSA_ID.match(parts[3])))
+            (parts[2] == "filed" and GHSA_ID.match(parts[3]))) and (
+            len(parts) == 4 or SIGNATURE_ID.match(parts[4]))
         if not ok:
             raise Refusal("the ledger's line %d is not a ledger line; nothing is filed until a "
                           "person mends it" % n)
         parse_utc(parts[0])
         state[parts[1]] = (parts[2], None if parts[3] == "-" else parts[3], parts[0])
-    return state
+        if len(parts) == 5:
+            sigs[parts[1]] = parts[4]
+    return state, causes, sigs
 
 
-def ledger_append(fd, finding, what, ghsa=None):
-    line = "%s\t%s\t%s\t%s\n" % (utc_text(utc_now()), finding, what, ghsa or "-")
+def ledger_state(text):
+    """{finding id: (state, advisory id or None, utc)}: the finding lines of ledger_parse."""
+    return ledger_parse(text)[0]
+
+
+def ledger_append(fd, finding, what, ghsa=None, signature=None):
+    line = "%s\t%s\t%s\t%s%s\n" % (utc_text(utc_now()), finding, what, ghsa or "-",
+                                    ("\t" + signature) if signature else "")
+    os.write(fd, line.encode())
+    os.fsync(fd)
+
+
+def cause_append(fd, signature, ghsa, count, commit):
+    line = "%s\t%s\tcause\t%s\t%d\t%s\n" % (utc_text(utc_now()), signature, ghsa, count, commit)
     os.write(fd, line.encode())
     os.fsync(fd)
 
@@ -485,8 +541,9 @@ def read_windows(path):
 
 
 def held_logs(held):
-    """[(name, sha256 hex, mtime, replay match or None, slot match or None)] for each regular file
-    under the held directory whose name is the supervisor's, and the count of other entries."""
+    """[(name, sha256 hex, mtime, replay match or None, slot match or None, cause)] for each regular
+    file under the held directory, where cause is (panic source file, message template); see
+    cause_of. It reads each log once, under the held directory whose name is the supervisor's, and the count of other entries."""
     try:
         st = os.lstat(held)
     except OSError as e:
@@ -515,19 +572,61 @@ def held_logs(held):
                 continue
             h = hashlib.sha256()
             replay = slot = None
+            panic = after = marked = None
             for raw in f:
                 h.update(raw)
+                if panic is not None and after is None:
+                    after = raw[:MAX_LINE]
+                if panic is None and (b"panicked at" in raw or b"PANIC" in raw):
+                    panic = raw[:MAX_LINE]
+                if marked is None and b"(replay:" in raw:
+                    marked = raw[:MAX_LINE]
                 if replay is None:
                     replay = REPLAY.search(raw)
                 if slot is None:
                     slot = SLOT_LINE.search(raw)
         if replay:
             secret(replay.group(2).decode())
-        out.append((name, h.hexdigest(), fst.st_mtime, replay, slot))
+        out.append((name, h.hexdigest(), fst.st_mtime, replay, slot, cause_of(panic, after, marked)))
     return out, other
 
 
-def describe(name, digest, replay, slot, windows):
+def template_of(message):
+    """The message with its replay suffix removed and each bracketed list, hexadecimal number and
+    decimal number replaced by a placeholder, so logs that differ only in seeds, timings and counts
+    agree. A number glued to a letter (`u64`) is part of a word and stays."""
+    message = REPLAY_SUFFIX.sub("", message)
+    message = BRACKETED.sub("[list]", message)
+    message = HEX_NUMBER.sub("<hex>", message)
+    message = DECIMAL_NUMBER.sub("<n>", message)
+    return " ".join(message.split())
+
+
+def cause_of(panic, after, marked):
+    """(source file without line number, message template) from a log's first panic line, the line
+    after it, and its first line carrying a replay command (each bytes or None). A panic line that
+    does not parse stands whole as the message with the file "-"; a log with no panic line falls
+    back to the replay line; a log with neither (a hang) is ("-", "-"). The result is only ever
+    hashed into the signature; it is never printed or stored."""
+    if panic is not None:
+        line = panic.decode(errors="replace").strip()
+        m = PANIC_AT.search(line)
+        if m:
+            message = m.group(1) or m.group(3) or (after or b"").decode(errors="replace")
+            return m.group(2), template_of(message)
+        return "-", template_of(line)
+    if marked is not None:
+        return "-", template_of(marked.decode(errors="replace"))
+    return "-", "-"
+
+
+def signature_of(driver, status, cause):
+    """The signature's short form: 12 hexadecimal digits of the SHA-256 of its four fields."""
+    fields = "\0".join((driver, status, cause[0], cause[1]))
+    return hashlib.sha256(fields.encode()).hexdigest()[:12]
+
+
+def describe(name, digest, replay, slot, windows, cause):
     """The finding's fields for its advisory, or a Refusal naming what does not agree."""
     first = HELD_NAME.match(name).group(1)
     rows = sorted(set(windows.get(first, [])))
@@ -554,7 +653,8 @@ def describe(name, digest, replay, slot, windows):
         seeds = "%d:1" % seed
     else:
         seeds = "%s:%d" % (first, WINDOW_SEEDS)
-    return {"finding": digest[:16], "class": status, "driver": driver, "commit": commit,
+    return {"finding": digest[:16], "signature": signature_of(driver, status, cause),
+            "class": status, "driver": driver, "commit": commit,
             "held_at": held_at, "seeds": seeds, "variable": variable,
             "filter": DRIVERS[driver]["filter"]}
 
@@ -634,7 +734,8 @@ def run(args):
         os.close(lock)
 
 
-def file_findings(args, github, home, fd, ledger):
+def file_findings(args, github, home, fd, parsed):
+    ledger, causes, sigs = parsed
     held = os.path.join(home, "state", "held")
     logs, other = held_logs(held)
     windows = read_windows(os.path.join(home, "state", "windows.tsv")) if logs else {}
@@ -643,27 +744,64 @@ def file_findings(args, github, home, fd, ledger):
             % other, err=True)
     now = time.time()
     refused = 0
-    todo, seen = [], set()
-    for name, digest, mtime, replay, slot in logs:
+    # One group per signature, its logs oldest first; each entry is (fields, age, mtime).
+    groups, seen = {}, set()
+    for name, digest, mtime, replay, slot, cause in sorted(logs, key=lambda e: (e[2], e[0])):
         fid = digest[:16]
         age = age_text(now - mtime)
         if fid in seen:
             continue
         seen.add(fid)
-        if ledger.get(fid, ("",))[0] == "filed":
-            continue
+        filed_before = ledger.get(fid, ("",))[0] == "filed"
         try:
-            todo.append((describe(name, digest, replay, slot, windows), age))
+            f = describe(name, digest, replay, slot, windows, cause)
         except Refusal as e:
-            refused += 1
-            say("finding %s (held %s) is refused: %s" % (fid, age, e), err=True)
-    filed = sum(1 for v in ledger.values() if v[0] == "filed")
+            if not filed_before:
+                refused += 1
+                say("finding %s (held %s) is refused: %s" % (fid, age, e), err=True)
+            continue
+        groups.setdefault(f["signature"], []).append((f, age, mtime))
+
+    # Signatures an advisory already covers, by advisory id: the cause lines, and the filed
+    # findings (a line from before signatures has none; its own log's signature stands for it).
+    covered = {sig: v[0] for sig, v in causes.items()}
+    for fid, sig in sigs.items():
+        if ledger.get(fid, ("",))[0] == "filed":
+            covered.setdefault(sig, ledger[fid][1])
+    for sig, entries in groups.items():
+        for f, _, _ in entries:
+            if ledger.get(f["finding"], ("",))[0] == "filed":
+                covered.setdefault(sig, ledger[f["finding"]][1])
+
+    def note(sig, ghsa):
+        """Record, once it changes, how many later logs share the signature and the newest commit."""
+        entries = groups[sig]
+        newest = max(entries, key=lambda e: e[2])[0]["commit"]
+        want = (ghsa, len(entries) - 1, newest)
+        if causes.get(sig) != want:
+            cause_append(fd, sig, *want)
+            causes[sig] = want
+
+    todo = []
+    for sig, entries in groups.items():
+        if sig in covered:
+            if not args.dry_run:
+                note(sig, covered[sig])
+            continue
+        pending = [e for e in entries if ledger.get(e[0]["finding"], ("",))[0] == "pending"]
+        todo.append((sig, (pending or entries)[0]))
+    filed = len(covered)
+    for sig, entries in groups.items():
+        if len(entries) > 1:
+            say("cause %s: %d held logs, one advisory" % (sig, len(entries)))
     if not todo:
-        say("%d held findings, %d filed before, none to file" % (len(seen), filed))
+        say("%d held logs, %d causes, %d filed before, none to file" % (len(seen), len(groups),
+                                                                       filed))
         return 1 if refused else 0
     if args.dry_run:
-        for f, age in todo:
-            say("would file finding %s (held %s)" % (f["finding"], age))
+        for sig, (f, age, _) in todo:
+            say("would file finding %s (held %s) for cause %s (%d held logs)"
+                % (f["finding"], age, sig, len(groups[sig])))
         return 1 if refused else 0
 
     try:
@@ -674,16 +812,27 @@ def file_findings(args, github, home, fd, ledger):
     except Refusal as e:
         say("%s; nothing is filed this run, so nothing is filed twice" % e, err=True)
         return 1
+
+    def on_github_ghsa(sig):
+        for f, _, _ in groups[sig]:
+            if f["finding"] in on_github:
+                return on_github[f["finding"]]
+        return None
+
     created = 0
-    for i, (f, age) in enumerate(todo):
+    for i, (sig, (f, age, _)) in enumerate(todo):
         fid = f["finding"]
-        if fid in on_github:
-            ledger_append(fd, fid, "filed", on_github[fid])
-            say("finding %s (held %s) is already advisory %s; recorded" % (fid, age,
-                                                                            on_github[fid]))
+        ghsa = on_github_ghsa(sig)
+        if ghsa is not None:
+            for g, gage, _ in groups[sig]:
+                if g["finding"] in on_github and ledger.get(g["finding"], ("",))[0] != "filed":
+                    ledger_append(fd, g["finding"], "filed", on_github[g["finding"]], sig)
+                    say("finding %s (held %s) is already advisory %s; recorded"
+                        % (g["finding"], gage, on_github[g["finding"]]))
+            note(sig, ghsa)
             continue
         if created >= args.max:
-            left = sum(1 for g, _ in todo[i:] if g["finding"] not in on_github)
+            left = sum(1 for s2, _ in todo[i:] if on_github_ghsa(s2) is None)
             say("%d findings wait for the next run (at most %d a run)" % (left, args.max))
             break
         if github.low():
@@ -692,7 +841,7 @@ def file_findings(args, github, home, fd, ledger):
             return EX_TEMPFAIL
         if created:
             time.sleep(args.pace)
-        ledger_append(fd, fid, "pending")
+        ledger_append(fd, fid, "pending", None, sig)
         try:
             status, answer, _ = github.call("POST", github.api + ADVISORIES_PATH, advisory_body(f))
         except RateLimited as e:
@@ -717,8 +866,10 @@ def file_findings(args, github, home, fd, ledger):
             say("finding %s (held %s): %s; the next run looks for it on GitHub" % (fid, age, e),
                 err=True)
             continue
-        ledger_append(fd, fid, "filed", ghsa)
-        say("filed finding %s (held %s) as %s" % (fid, age, ghsa))
+        ledger_append(fd, fid, "filed", ghsa, sig)
+        note(sig, ghsa)
+        say("filed finding %s (held %s) as %s for cause %s (%d held logs)"
+            % (fid, age, ghsa, sig, len(groups[sig])))
         for w in wrong:
             refused += 1
             say("advisory %s for finding %s: %s" % (ghsa, fid, w), err=True)
@@ -728,13 +879,15 @@ def file_findings(args, github, home, fd, ledger):
 def show_ledger(args):
     try:
         with open(args.ledger, "rb") as f:
-            state = ledger_state(f.read().decode(errors="replace"))
+            state, causes, _ = ledger_parse(f.read().decode(errors="replace"))
     except FileNotFoundError:
-        state = {}
+        state, causes = {}, {}
     now = utc_now()
     for fid, (what, ghsa, when) in sorted(state.items(), key=lambda kv: kv[1][2]):
         print("%s\t%s\t%s\t%s ago" % (fid, what, ghsa or "-",
                                       age_text((now - parse_utc(when)).total_seconds())))
+    for sig, (ghsa, count, commit) in sorted(causes.items()):
+        print("cause %s\t%s\t%d later logs\tnewest commit %s" % (sig, ghsa, count, commit))
     return 0
 
 

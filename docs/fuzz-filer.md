@@ -23,12 +23,21 @@ reads the advisory and never the held directory. `fuzz-filer` is that program.
 2. Takes its ledger's lock, so two runs never overlap.
 3. Reads each held log and names the finding by its content: the first 16 hexadecimal digits of the
    SHA-256 of the log. The same log under two names is one finding.
-4. For each finding the ledger does not record as filed, reads its window's row from
+4. Groups the findings by cause. A log's signature is its driver, its class, the source file of its
+   panic (without the line number) and the panic's message with the `(replay: ...)` suffix removed
+   and every hexadecimal number, decimal number and bracketed list replaced by a placeholder; the
+   signature's short form is the first 12 hexadecimal digits of the SHA-256 of those four fields.
+   A log with no panic line falls back to its first line that names a panic or carries a replay
+   command; a hang has neither, so it is one signature per driver. Only the oldest log of a
+   signature is filed; the rest are counted in the ledger and not filed. A signature the ledger or
+   an advisory already covers is not filed again. The filer prints signature short forms and counts,
+   never the file or the message.
+4a. For each cause not yet covered, reads its window's row from
    `windows.tsv` (driver, commit, class, time) and checks that the log and the row describe the same
    window. A finding that does not agree is refused by id and age, and the others go on.
 5. Lists the repository's advisories once and reads each one's `Finding:` line. A finding already
-   on GitHub is recorded as filed and never created again. A failed listing files nothing.
-6. Creates one draft advisory per remaining finding, writing `pending` to the ledger before the
+   on GitHub is recorded as filed and never created again, and its whole cause counts as covered. A failed listing files nothing.
+6. Creates one draft advisory per remaining cause, at most `--max` a run, writing `pending` to the ledger before the
    call and `filed` with the advisory id after it, and checks that GitHub's answer is a draft that
    names a package and a range.
 
@@ -62,10 +71,13 @@ with `NIFE_CONFINED_FUZZ_SEEDS` and `a_confined_fuzzer` for the confined driver.
 of mode 0700 that systemd's `StateDirectory=` makes. Each line is
 
 ```
-<utc>	<finding id>	pending|filed	<advisory id or ->
+<utc>	<finding id>	pending|filed	<advisory id or ->	<signature short form>
+<utc>	<signature short form>	cause	<advisory id>	<later logs>	<newest commit>
 ```
 
-and the last line of a finding wins. A line of any other shape stops every run until a person mends
+The first form is a finding; its fifth field is optional, because a ledger written before signatures
+has four. The second is one cause: its advisory, how many later logs share its signature, and the
+commit of the newest of them. The last line of a finding, and of a cause, wins. A line of any other shape stops every run until a person mends
 it. The ledger holds no seed, no held log's name and no advisory text. `ledger_state()` in
 `bin/fuzz-filer` is the one reader of this format; a program that reads the ledger (the publish
 milestone will) imports it rather than parsing the file itself. `fuzz-filer ledger` prints each
@@ -83,7 +95,9 @@ one.
   withheld too. Every line passes through a filter that replaces each seed, name and token the run
   has seen, and an error answer to a create prints only GitHub's field names and error codes,
   because its message may echo the advisory.
-- It never files a finding twice: the ledger and the listing both have to miss it.
+- It never files a finding twice: the ledger and the listing both have to miss it. Nor does it file
+  a second advisory for a cause: the advisory body gains no detail for that, and the signature never
+  appears in it.
 - It never reads the App key, and it refuses a token of the wrong profile or a stale one before it
   opens the held directory.
 - It never follows an HTTP redirect, and it talks to `https://api.github.com` and nothing else,
