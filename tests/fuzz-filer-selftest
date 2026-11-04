@@ -339,6 +339,10 @@ def run_tests(tmp):
         for want in ("- Class: ", "- Driver: ", "- Commit: " + COMMIT, "cargo xtask test",
                      "- Finding: "):
             check("a description holds %r" % want, want in d)
+        check("a description says a person publishes it after the fix, or after 90 days",
+              "It stays private until a person publishes it after the fix, or until 90 days after "
+              "this report." in d, d)
+        check("a description promises no rerun-based publish", "rerun" not in d, d)
         classes.add(d.split("- Class: ")[1].split("\n")[0])
         check("no summary holds a seed",
               not any(s in body["summary"] for s in list(FIRSTS.values()) + [REPLAY_SEED]),
