@@ -136,7 +136,7 @@ the unit's own state directory. Should the ruling change, the change here is the
 
 ## Install, for a person with root on the fuzz host
 
-Do this after the key is in place and `fuzz-token` is installed (steps P4 and P6 of nife's
+Do this after the key is in place and `fuzz-token` is installed (steps P5, "Generate the `nife-fuzz` key and place it on the fuzz host", and P6, "Install the mint helper and its publish token", of nife's
 `notes/fuzzing/finishing-the-setup.md`), and with the accepted risk above in mind.
 Fetch this repository into your own account, not the fuzz account, and review the commit you
 install.
