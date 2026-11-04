@@ -28,11 +28,12 @@ A lane runs as an unprivileged account and cannot read the key. It asks root for
 one sudo rule, which names one command with its arguments fixed:
 
 ```sh
-GH_TOKEN="$(sudo -n /usr/local/sbin/fuzz-token issue reader)" <the advisory-reading script> <id>
+NIFE_ADVISORY_READER_TOKEN="$(sudo -n /usr/local/sbin/fuzz-token issue reader)" script/read-advisory <id>
 ```
 
 `issue reader` mints a token and writes it, alone on one line, to standard output, which the shell
-captures into `GH_TOKEN` for that one command. Standard error gets one line naming the caller, the
+captures into `NIFE_ADVISORY_READER_TOKEN` for that one command. That is the variable nife's
+`script/read-advisory` reads; the script hands it to `gh` as `GH_TOKEN` itself. Standard error gets one line naming the caller, the
 permission, the repository and the expiry, never the token. The token lives one hour; a lane that
 needs the advisory again asks again. Nothing stores it: no file, no log, no environment beyond the
 one command.
@@ -48,7 +49,7 @@ one command.
   from the caller reaches it;
 - revokes the token when it cannot write it, for example when the reader of the pipe has gone.
 
-A lane's own discipline does the rest: it never echoes `GH_TOKEN`, never runs the line under
+A lane's own discipline does the rest: it never echoes `NIFE_ADVISORY_READER_TOKEN`, never runs the line under
 `set -x`, and never writes the output of the command substitution anywhere but the variable.
 
 ## Choosing the channel
