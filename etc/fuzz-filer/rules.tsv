@@ -1,0 +1,16 @@
+# fuzz-filer's rules: which causes it never files, and which parked causes it files.
+# Installed root-owned as /usr/local/etc/fuzz-filer/rules.tsv; docs/fuzz-filer.md, "Rules".
+# This file is public. A rule names a signature's short form and a reason, never a seed, a
+# message, a source file, an input or anything a held log holds. A cause that may be a real
+# finding never gets a suppress rule: that is what its advisory is for.
+#
+# One rule a line, five fields separated by tabs:
+#   signature   12 hexadecimal digits, as `fuzz-filer run --dry-run` prints it
+#   action      suppress (never filed; `fuzz-filer archive` moves its logs aside)
+#               or file (filed although its kind, budget or hang, is parked)
+#   scope       started-before=<YYYY-MM-DDTHH:MM:SSZ> or commits=<commit>[,<commit>...];
+#               any is allowed for file alone, so every suppression ends
+#   date        the UTC date the rule was written, YYYY-MM-DD
+#   reason      printable ASCII: why, and what fixed it (a pull request), if anything
+#
+# Name: provisional, as are the path, the actions and the scopes.
