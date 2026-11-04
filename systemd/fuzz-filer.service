@@ -4,9 +4,9 @@
 # /var/lib/fuzz-filer. See docs/fuzz-filer.md.
 # Name: provisional.
 #
-# User=lane is the account the supervisor runs as, the only one that can read the held directory
-# today, and the reader fuzz-token gives the filer token by default. Whether the filer gets its own
-# account is an open question for the architect (docs/fuzz-filer.md, "Which account it runs as").
+# Ruled 2026-11-03: the filer runs as User=lane, with no separate account. lane is the account the
+# supervisor runs as, the only one that can read the held directory, and the reader fuzz-token gives
+# the filer token by default (docs/fuzz-filer.md, "Which account it runs as").
 [Unit]
 Description=File held fuzz findings as private advisories on nifeos/nife
 Documentation=https://github.com/nifeos/fuzz-host/blob/main/docs/fuzz-filer.md
