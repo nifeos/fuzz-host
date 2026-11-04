@@ -74,7 +74,8 @@ mints a fresh token every 20 minutes, so the file always holds one with at least
 
 ## Install, for a person with root on the fuzz host
 
-Do this after the key is in place (step P4 of nife's `notes/fuzzing/finishing-the-setup.md`). Fetch
+Do this after the key is in place (step P5, "Generate the `nife-fuzz` key and place it on the fuzz
+host", of nife's `notes/fuzzing/finishing-the-setup.md`; this document's install is its step P6). Fetch
 this repository into your own account, not the fuzz account, and review the commit you install.
 
 ```sh
