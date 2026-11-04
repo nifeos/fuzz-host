@@ -27,6 +27,16 @@ a stub on 127.0.0.1. It checks:
   class or driver is a separate signature; the ledger keeps a count and the newest commit; a ledger
   from before signatures still reads and refiles nothing; a signature already in the ledger is not
   refiled, even after its first log is gone; the cap of 10 a run holds;
+- kinds (section 18): silent hangs, tick budget expiry and the held-budget-expired class are
+  parked, never filed, and listed by signature; hangs that stopped in different places are
+  different causes; a file rule files a parked cause once, seeded as its log says; a suppression
+  wins over a file rule; a suppression scoped by start time or by commit holds only those logs, and
+  a later log of the same signature is a new cause, filed once; archive moves every copy of each
+  suppressed log aside (dry run first) and never overwrites; every malformed, unsafe or missing
+  rules file refuses the run; the shipped rules file parses;
+- the dry run (section 19): with no token and no ledger directory it names what it would file and
+  changes nothing on disk; it creates no ledger and no lock, reads an existing ledger, refuses a
+  held lock or a ledger of the wrong mode, and a real run without a token is still refused;
 - that nothing the filer printed in any of these runs, and nothing in its ledger, holds a planted
   seed, a held log's name, a replay line or the token, even when GitHub's error message echoes them.
 
@@ -240,24 +250,33 @@ def write_token(path, perms="repository_advisories:write", repos="nifeos/nife", 
     os.chmod(path, mode)
 
 
-def held_log(held, first, lines):
-    name = "20261103T%s0000Z-%s.log" % (first[3:5], first)
+def held_log(held, first, lines, started=None):
+    """Write a held log named, as the supervisor names it, by its window's start and first seed.
+    The start defaults to a valid time derived from the seed."""
+    started = started or "20261103T%02d%02d00Z" % (int(first[3:5]) % 24, int(first[5:7]) % 60)
+    name = "%s-%s.log" % (started, first)
     with open(os.path.join(held, name), "w") as f:
         f.write("\n".join(lines) + "\n")
     return name
 
 
+def write_rules(path, rules=(), mode=0o644):
+    """The rules file, one rule a tuple of five fields, beside a header comment."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o755)
+    if os.path.lexists(path):
+        os.unlink(path)
+    with open(path, "w") as f:
+        f.write("# selftest rules\n")
+        for r in rules:
+            f.write("\t".join(r) + "\n")
+    os.chmod(path, mode)
+
+
 class Env:
     def __init__(self, tmp):
-        self.tmp = tmp
-        self.home = os.path.join(tmp, "fuzz")
-        self.held = os.path.join(self.home, "state", "held")
-        os.makedirs(self.held)
-        os.chmod(self.held, 0o700)
-        self.statedir = os.path.join(tmp, "var-lib-fuzz-filer")
-        os.mkdir(self.statedir, 0o700)
-        self.ledger = os.path.join(self.statedir, "ledger.tsv")
-        self.token = os.path.join(tmp, "filer.env")
+        self.setup(tmp)
         write_token(self.token)
         f = FIRSTS
         rows = [
@@ -284,13 +303,36 @@ class Env:
                 % f["crash"], "kernel PANIC at somewhere"]),
             held_log(self.held, f["hang"], [
                 "continuous-fuzz: slot 2: kernel-thread, seeds from %s, accelerator kvm, image x"
-                % f["hang"], "(no end line: the bound ran out)"]),
+                % f["hang"], "kernel PANIC at elsewhere, then the guest halts",
+                "(no end line: the bound ran out)"]),
         ]
+
+    def setup(self, tmp):
+        """The directories every environment has: the fuzz home, the held directory, the ledger's
+        directory, an empty rules file, and the token's path (no token yet)."""
+        self.tmp = tmp
+        self.home = os.path.join(tmp, "fuzz")
+        self.held = os.path.join(self.home, "state", "held")
+        os.makedirs(self.held)
+        os.chmod(self.held, 0o700)
+        self.statedir = os.path.join(tmp, "var-lib-fuzz-filer")
+        os.mkdir(self.statedir, 0o700)
+        self.ledger = os.path.join(self.statedir, "ledger.tsv")
+        self.token = os.path.join(tmp, "filer.env")
+        self.rules = os.path.join(tmp, "etc", "rules.tsv")
+        write_rules(self.rules)
 
     def run(self, *extra, api=None):
         argv = ["run", "--fuzz-home", self.home, "--ledger", self.ledger, "--token-file",
-                self.token, "--token-group", MY_GROUP, "--api", api or API, "--pace", "0"]
+                self.token, "--token-group", MY_GROUP, "--api", api or API, "--pace", "0",
+                "--rules", self.rules]
         argv += list(extra)
+        return self.main(argv)
+
+    def archive(self, *extra):
+        return self.main(["archive", "--fuzz-home", self.home, "--rules", self.rules] + list(extra))
+
+    def main(self, argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = MOD.main(argv)
@@ -332,6 +374,7 @@ def main():
 
 def run_tests(tmp):
     MOD.TOKEN_OWNER_UID = os.geteuid()
+    MOD.RULES_OWNER_UID = os.geteuid()
 
     shape_checks()
     # 1. Three held windows, one per class: three creates, each well formed.
@@ -629,15 +672,7 @@ def run_tests(tmp):
         """An Env-like directory holding only the held logs `specs` describe, oldest first:
         (first seed, driver, class, commit, log lines)."""
         e = Env.__new__(Env)
-        e.tmp = os.path.join(tmp, name)
-        e.home = os.path.join(e.tmp, "fuzz")
-        e.held = os.path.join(e.home, "state", "held")
-        os.makedirs(e.held)
-        os.chmod(e.held, 0o700)
-        e.statedir = os.path.join(e.tmp, "var-lib-fuzz-filer")
-        os.mkdir(e.statedir, 0o700)
-        e.ledger = os.path.join(e.statedir, "ledger.tsv")
-        e.token = os.path.join(e.tmp, "filer.env")
+        e.setup(os.path.join(tmp, name))
         write_token(e.token)
         e.names = []
         e.fids = []
@@ -647,10 +682,11 @@ def run_tests(tmp):
     def add(e, specs):
         base_time = 1_700_000_000 + len(e.names) * 1000
         with open(os.path.join(e.home, "state", "windows.tsv"), "a") as w:
-            for k, (first, driver, status, commit, lines) in enumerate(specs):
+            for k, spec in enumerate(specs):
+                first, driver, status, commit, lines = spec[:5]
                 w.write("\t".join(("2026-11-03T01:00:00Z", driver, "0", first, "1", "61000",
                                    status, commit)) + "\n")
-                name = held_log(e.held, first, lines)
+                name = held_log(e.held, first, lines, *spec[5:])
                 path = os.path.join(e.held, name)
                 os.utime(path, (base_time + k * 10, base_time + k * 10))
                 e.names.append(name)
@@ -671,7 +707,7 @@ def run_tests(tmp):
     STUB.reset()
     code, text = a.run("--dry-run")
     check("a dry run names one finding for five logs of one cause",
-          code == 0 and text.count("would file finding") == 1 and "(5 held logs)" in text and
+          code == 0 and text.count("would file finding") == 1 and "(replay, 5 held logs)" in text and
           STUB.requests == [], (code, text))
     code, text = a.run()
     check("five logs that differ in seeds, timings, numbers and line numbers file one advisory",
@@ -819,6 +855,9 @@ def run_tests(tmp):
     check("no output or ledger holds a seed, a log name, a message or a source file", not leaks,
           leaks)
 
+    kinds_rules_archive(tmp, mini, finding)
+    safe_dry_run(tmp, mini, finding)
+
     # 16. Nothing printed, and no ledger, holds a seed, a held log's name, a replay line or the
     # token.
     planted = list(FIRSTS.values()) + [REPLAY_SEED, TOKEN, "replay:", "NIFE_SYSCALL_FUZZ_SEEDS",
@@ -830,6 +869,411 @@ def run_tests(tmp):
     leaks = sorted({p for p in planted for o in outputs if p in o})
     check("no output or ledger holds a planted seed, name, replay line or token", not leaks, leaks)
     check("the leak scan saw output", sum(len(o) for o in outputs) > 1000)
+
+
+# Section 18 onward share these. Every message, file and seed is invented.
+SEEDS18 = []
+LOG_NAMES18 = []
+BUDGET_TEXT = ("invented wait gave up: %d ms of the counter; ticks taken of %d on each core: "
+               "core 0 %d core 1 %d")
+FP_TEXT = "fuzzer: seed %(hex)s step %(n)d: invented oracle disagreement on [%(list)s] at %(ms)d ms"
+
+
+def slot_line(first, driver="kernel-thread"):
+    return "continuous-fuzz: slot 0: %s, seeds from %s, accelerator kvm, image x" % (driver, first)
+
+
+def hang(first, last_lines, commit="ddd1111"):
+    """A held hang: no panic and no replay line, the guest's last lines `last_lines`."""
+    SEEDS18.append(first)
+    return (first, "kernel-thread", "held-hang", commit,
+            [slot_line(first), "build: compiled 100 crates in 4.2 s"] + last_lines +
+            ["qemu-bounded.sh: the bound of 300 s ran out"])
+
+
+def budget(first, status="held-crash", k=0, commit="eee1111"):
+    """A held window whose driver gave up on the tick budget, as a crash or as a finding."""
+    seed = str(int(first) + 3)
+    SEEDS18.extend([first, seed])
+    msg = BUDGET_TEXT % (2000 + k * 31, 200, 150 + k, 40 + k)
+    if status == "held-finding":
+        msg += " (replay: NIFE_SYSCALL_FUZZ_SEEDS=%s:1)" % seed
+    return (first, "kernel-thread", status, commit,
+            [slot_line(first), "[PANIC] panicked at system_tests/src/user/invented_fuzzer.rs:%d:9:"
+             % (100 + k), msg])
+
+
+def tracked(finding):
+    """finding(), recording its seeds for the leak scan, with an optional start time."""
+    def make(first, started=None, **kw):
+        SEEDS18.extend([first, str(int(first) + 5 + kw.get("build", 0))])
+        spec = finding(first, **kw)
+        return spec + ((started,) if started else ())
+    return make
+
+
+def hang_signature(last, driver="kernel-thread"):
+    return MOD.signature_of(driver, "held-hang", MOD.cause_of(None, None, None, last))
+
+
+def cause_lines(text):
+    """{signature: the run's line about it}."""
+    return {m.group(1): m.group(0) for m in
+            __import__("re").finditer(r"cause ([0-9a-f]{12}) \(\w+\)[^\n]*", text)}
+
+
+def kinds_rules_archive(tmp, mini, finding):
+    finding = tracked(finding)
+
+    # 18. Kinds. A silent hang and a tick budget expiry are parked: counted, never filed. A hang's
+    # cause is its last guest line, so hangs that stopped in different places stay apart, and two
+    # that differ only in numbers stay together. A budget expiry is parked whatever its class.
+    k = mini("t1", [
+        hang("7396%07d" % 0, ["invented step 12 of actor 3"]),
+        hang("7396%07d" % 10, ["invented step 977 of actor 1"]),
+        hang("7396%07d" % 20, ["invented lock wait on slot 4"]),
+        budget("7396%07d" % 40, k=0),
+        budget("7396%07d" % 50, k=7),
+        budget("7396%07d" % 60, status="held-finding", k=2),
+        finding("7396%07d" % 70),
+    ])
+    LOG_NAMES18.extend(k.names)
+    STUB.reset()
+    code, text = k.run()
+    lines = cause_lines(text)
+    parked = [l for l in lines.values() if "parked" in l]
+    check("hangs and budget expiry are parked and only the panic is filed",
+          code == 0 and len(creates()) == 1 and "held-finding" in creates()[0][2]["summary"],
+          (code, text))
+    check("two hangs that differ only in numbers share a cause; one that stopped elsewhere has its "
+          "own", sum(1 for l in parked if "(hang): 2 held logs" in l) == 1 and
+          sum(1 for l in parked if "(hang): 1 held logs" in l) == 1, text)
+    check("a budget expiry is parked as a crash and as a finding, each its own cause",
+          sum(1 for l in parked if "(budget): 2 held logs" in l) == 1 and
+          sum(1 for l in parked if "(budget): 1 held logs" in l) == 1, text)
+    check("the run's tally counts four parked causes", "4 parked" in text, text)
+    STUB.requests = []
+    before = k.ledger_text()
+    code, text = k.run()
+    check("parked causes send nothing and write nothing on the next run",
+          code == 0 and STUB.requests == [] and k.ledger_text() == before, (code, text))
+
+    # Hang signatures, directly.
+    check("a hang's cause is its last guest line, normalized",
+          hang_signature(b"invented step 1 of actor 2\n") ==
+          hang_signature(b"invented step 99 of actor 7\n") and
+          hang_signature(b"invented step 1 of actor 2\n") !=
+          hang_signature(b"invented lock wait on slot 4\n"))
+    check("a hang with no guest line at all has the bare hang cause",
+          MOD.cause_of(None, None, None, None) == (MOD.HANG_FILE, "-"))
+    check("a hang's cause never equals a panic's",
+          MOD.cause_of(None, None, None, b"x\n") != MOD.cause_of(b"PANIC x\n", None, None, None))
+    check("the kinds", MOD.kind_of("held-hang", MOD.cause_of(None, None, None, b"x\n")) == "hang"
+          and MOD.kind_of("held-hang", MOD.cause_of(b"PANIC x\n", None, None, None)) == "panic"
+          and MOD.kind_of("held-finding", ("-", "a mismatch")) == "replay"
+          and MOD.kind_of("held-finding", ("-", MOD.template_of(BUDGET_TEXT % (1, 2, 3, 4))))
+          == "budget")
+    check("a panic's signature did not change with kinds: a filed cause is never refiled",
+          MOD.signature_of("d", "held-crash", MOD.cause_of(b"panicked at a/b.rs:1:2:\n", b"boom\n",
+                                                           None)) ==
+          __import__("hashlib").sha256("\0".join(("d", "held-crash", "a/b.rs", "boom"))
+                                       .encode()).hexdigest()[:12])
+
+    # 18a. A `file` rule files a parked cause once; its repeat is still deduped.
+    lock_wait = hang_signature(b"invented lock wait on slot 4\n")
+    write_rules(k.rules, [(lock_wait, "file", "any", "2026-11-04", "selftest: a parked hang to file")])
+    STUB.reset()
+    code, text = k.run()
+    check("a file rule files the parked hang once", code == 0 and len(creates()) == 1 and
+          "held-hang" in creates()[0][2]["summary"], (code, text))
+    STUB.requests = []
+    code, text = k.run()
+    check("and the next run files nothing", code == 0 and STUB.requests == [], (code, text))
+
+    # 18b. A suppression wins over a file rule.
+    write_rules(k.rules, [
+        (lock_wait, "file", "any", "2026-11-04", "selftest"),
+        (hang_signature(b"invented step 1 of actor 1\n"), "file", "any", "2026-11-04", "selftest"),
+        (hang_signature(b"invented step 1 of actor 1\n"), "suppress", "commits=ddd1111",
+         "2026-11-04", "selftest: infrastructure"),
+    ])
+    STUB.reset()
+    code, text = k.run()
+    check("a suppression wins over a file rule", code == 0 and creates() == [] and
+          "suppressed by rule line 4" in text, (code, text))
+
+    # 18b2. The held-budget-expired class: parked whether its log has a replay line or not, and
+    # filed by a file rule with the replay seed when it has one and the window's range when not.
+    first_r, first_b = "7401%07d" % 0, "7401%07d" % 10
+    seed_r = str(int(first_r) + 9)
+    SEEDS18.extend([first_r, first_b, seed_r])
+    be = mini("t1b", [
+        (first_r, "confined", "held-budget-expired", "abc9999",
+         [slot_line(first_r, "confined"), "invented teardown gave up on slot [1, 2] "
+          "(replay: NIFE_CONFINED_FUZZ_SEEDS=%s:1)" % seed_r]),
+        (first_b, "kernel-thread", "held-budget-expired", "abc9999",
+         [slot_line(first_b), "[PANIC] panicked at system_tests/src/user/invented_fuzzer.rs:7:1:",
+          "invented wait ran dry after 12 ms"]),
+    ])
+    LOG_NAMES18.extend(be.names)
+    STUB.reset()
+    code, text = be.run("--dry-run")
+    check("held-budget-expired logs, with and without a replay line, are listed and parked",
+          code == 0 and "would file" not in text and text.count("(budget): 1 held logs, parked")
+          == 2 and "2 parked" in text, (code, text))
+    code, text = be.run()
+    check("a real run files no held-budget-expired log and sends nothing",
+          code == 0 and STUB.requests == [], (code, text))
+    be_sigs = list(cause_lines(text))
+    write_rules(be.rules, [(s_, "file", "any", "2026-11-04", "selftest: an override")
+                           for s_ in be_sigs])
+    code, text = be.run()
+    bodies = [b["description"] for _, _, b, _ in creates()]
+    check("a file rule files each held-budget-expired cause, seeded as its log says",
+          code == 0 and len(bodies) == 2 and
+          any("NIFE_CONFINED_FUZZ_SEEDS=%s:1 " % seed_r in b and "- Seed: `" in b for b in bodies)
+          and any("NIFE_SYSCALL_FUZZ_SEEDS=%s:1000000 " % first_b in b and "- Seed range" in b
+                  for b in bodies) and
+          all("- Class: held-budget-expired" in b for b in bodies), (code, text, bodies))
+
+    # 18c. A suppression scoped by start time: logs that started before it are never filed; a
+    # later log of the same signature is a new cause and is filed, and its repeats are deduped.
+    fp = mini("t2", [finding("7397%07d" % (n * 10), text=FP_TEXT, commit="fff%04d" % n,
+                             line=50 + n, build=n, started="20261101T0%d0000Z" % n)
+                     for n in range(3)])
+    LOG_NAMES18.extend(fp.names)
+    STUB.reset()
+    code, text = fp.run("--dry-run")
+    sig = __import__("re").search(r"for cause ([0-9a-f]{12}) \(replay, 3 held logs\)", text)
+    check("a dry run names the cause a person writes a rule for", code == 0 and sig is not None,
+          text)
+    sig = sig.group(1) if sig else "000000000000"
+    write_rules(fp.rules, [(sig, "suppress", "started-before=2026-11-02T00:00:00Z", "2026-11-04",
+                            "selftest: a false positive of an oracle, fixed upstream")])
+    code, text = fp.run("--dry-run")
+    check("the dry run says the cause is suppressed and files nothing",
+          code == 0 and "would file" not in text and "suppressed by rule line 2" in text and
+          "3 suppressed" in text, text)
+    STUB.reset()
+    code, text = fp.run()
+    check("a suppressed cause sends nothing and files nothing", code == 0 and STUB.requests == []
+          and "\tfiled\t" not in fp.ledger_text(), (code, text))
+    fp.add([finding("7397%07d" % 900, text=FP_TEXT, commit="fff0900", line=77, build=9,
+                    started="20261103T050000Z")])
+    LOG_NAMES18.append(fp.names[-1])
+    code, text = fp.run()
+    check("a log of that signature that started after the suppression is a new cause, filed",
+          code == 0 and len(creates()) == 1 and
+          "- Finding: %s" % fp.fids[-1] in creates()[0][2]["description"], (code, text))
+    fp.add([finding("7397%07d" % 950, text=FP_TEXT, commit="fff0950", line=78, build=11,
+                    started="20261103T060000Z")])
+    LOG_NAMES18.append(fp.names[-1])
+    STUB.requests = []
+    code, text = fp.run()
+    check("and its true repeat is deduped", code == 0 and STUB.requests == [], (code, text))
+
+    # 18d. A suppression scoped by commit.
+    cm = mini("t3", [finding("7398%07d" % 0, commit="c0ffee1"),
+                     finding("7398%07d" % 10, commit="c0ffee1", build=2),
+                     finding("7398%07d" % 20, commit="dec0de2", build=3)])
+    LOG_NAMES18.extend(cm.names)
+    s = MOD.signature_of("kernel-thread", "held-finding", MOD.cause_of(
+        cm_panic(cm.held, cm.names[0]), cm_after(cm.held, cm.names[0]), None))
+    write_rules(cm.rules, [(s, "suppress", "commits=c0ffee1,abcdef0", "2026-11-04", "selftest")])
+    STUB.reset()
+    code, text = cm.run()
+    check("a commits= suppression holds the logs at those commits and files the one at another",
+          code == 0 and len(creates()) == 1 and "dec0de2" in creates()[0][2]["description"] and
+          "2 suppressed" in text, (code, text))
+
+    # 18e. Archive: dry run moves nothing; archive moves every copy of each suppressed log to
+    # state/archived/<signature>/, mode 0700, and leaves the rest held.
+    shutil.copy(os.path.join(fp.held, fp.names[0]),
+                os.path.join(fp.held, "20261101T003000Z-%s.log" % ("7397%07d" % 0)))
+    LOG_NAMES18.append("20261101T003000Z-%s.log" % ("7397%07d" % 0))
+    held_before = sorted(os.listdir(fp.held))
+    code, text = fp.archive("--dry-run")
+    check("archive --dry-run moves nothing and counts every copy",
+          code == 0 and sorted(os.listdir(fp.held)) == held_before and
+          "would archive 4 held logs of cause %s (rule line 2)" % sig in text and
+          not os.path.exists(os.path.join(fp.home, "state", "archived")), (code, text))
+    code, text = fp.archive()
+    target = os.path.join(fp.home, "state", "archived", sig)
+    moved = sorted(os.listdir(target)) if os.path.isdir(target) else []
+    check("archive moves the four suppressed logs aside and keeps the two later ones held",
+          code == 0 and len(moved) == 4 and len(os.listdir(fp.held)) == 2 and
+          "archived 4 held logs of cause %s" % sig in text, (code, text, moved))
+    check("the archive directories are mode 0700",
+          all((os.stat(p).st_mode & 0o777) == 0o700 for p in (target, os.path.dirname(target))))
+    code, text = fp.archive()
+    check("a second archive has nothing to move and names the rule that matches nothing",
+          code == 0 and "nothing to archive" in text and "rule line 2 (suppress %s) matches no "
+          "held log" % sig in text, (code, text))
+    STUB.requests = []
+    code, text = fp.run()
+    check("a run after the archive files nothing", code == 0 and STUB.requests == [], (code, text))
+    # A name already in the archive is never overwritten: that log stays held.
+    clash = "20261101T020000Z-%s.log" % ("7397%07d" % 20)
+    with open(os.path.join(fp.held, clash), "w") as f:
+        with open(os.path.join(target, clash)) as g:
+            f.write(g.read() + "one more invented line\n")
+    code, text = fp.archive()
+    check("archive refuses to overwrite an archived log of the same name and leaves it held",
+          code == 1 and os.path.exists(os.path.join(fp.held, clash)) and
+          "already archived" in text, (code, text))
+
+    # 18f. Rules refusals: each exits 3 and sends nothing, in a run and in a dry run.
+    r = mini("t4", [finding("7399%07d" % 0)])
+    LOG_NAMES18.extend(r.names)
+    good = ("0123456789ab", "suppress", "started-before=2026-11-02T00:00:00Z", "2026-11-04", "ok")
+    bad_lines = [
+        ("a suppression with no end", [("0123456789ab", "suppress", "any", "2026-11-04", "x")]),
+        ("four fields", [good[:4]]),
+        ("a short signature", [("0123", ) + good[1:]]),
+        ("an unknown action", [good[:1] + ("ignore",) + good[2:]]),
+        ("an impossible date", [good[:3] + ("2026-13-40", "x")]),
+        ("an unknown scope", [good[:2] + ("forever",) + good[3:]]),
+        ("a bad start time", [good[:2] + ("started-before=yesterday",) + good[3:]]),
+        ("a bad commit", [good[:2] + ("commits=c0ffee1,zz",) + good[3:]]),
+        ("an empty reason", [good[:4] + (" ",)]),
+    ]
+    for what, rules in bad_lines:
+        write_rules(r.rules, rules)
+        for dry in ((), ("--dry-run",)):
+            STUB.reset()
+            code, text = r.run(*dry)
+            check("refuses a rules file with %s%s" % (what, " (dry run)" if dry else ""),
+                  code == 3 and STUB.requests == [] and "not a rule" in text, (code, text))
+    write_rules(r.rules)
+    with open(r.rules, "ab") as f:
+        f.write(b"0123456789ab\tsuppress\tany\t2026-11-04\tr\xc3\xa9sum\xc3\xa9\n")
+    code, text = r.run()
+    check("refuses a rules file that is not ASCII", code == 3 and STUB.requests == [], text)
+    write_rules(r.rules, mode=0o664)
+    code, text = r.run()
+    check("refuses a group-writable rules file", code == 3 and STUB.requests == [], text)
+    write_rules(r.rules)
+    os.chmod(os.path.dirname(r.rules), 0o775)
+    code, text = r.run()
+    check("refuses a group-writable rules directory", code == 3 and STUB.requests == [], text)
+    write_rules(r.rules)
+    MOD.RULES_OWNER_UID = os.geteuid() + 1
+    try:
+        code, text = r.run()
+    finally:
+        MOD.RULES_OWNER_UID = os.geteuid()
+    check("refuses a rules file of another owner", code == 3 and STUB.requests == [], text)
+    os.unlink(r.rules)
+    code, text = r.run()
+    check("refuses a missing rules file", code == 3 and STUB.requests == [] and
+          "cannot be opened" in text, text)
+    write_rules(os.path.join(tmp, "t4-real-rules", "rules.tsv"))
+    os.symlink(os.path.join(tmp, "t4-real-rules", "rules.tsv"), r.rules)
+    code, text = r.run()
+    check("refuses a rules file reached through a link", code == 3 and STUB.requests == [], text)
+    check("no refused run made a ledger", not os.path.exists(r.ledger))
+
+    # 18g. The rules file this repository ships parses.
+    with open(os.path.join(ROOT, "etc", "fuzz-filer", "rules.tsv")) as f:
+        try:
+            MOD.rules_parse(f.read())
+            ok = True
+        except MOD.Refusal as e:
+            ok = str(e)
+    check("the shipped rules file parses", ok is True, ok)
+
+    planted = SEEDS18 + LOG_NAMES18 + ["invented", "_fuzzer.rs", "ms of the counter",
+                                       "lock wait", "oracle disagreement"]
+    for e in (k, fp, cm, r):
+        outputs.append(e.ledger_text())
+    leaks = sorted({p for p in planted for o in outputs if p in o})
+    check("no output, ledger or archive line holds a seed, a log name, a message or a file",
+          not leaks, leaks)
+
+
+def cm_panic(held, name):
+    with open(os.path.join(held, name), "rb") as f:
+        lines = f.read().splitlines(True)
+    return next(l for l in lines if b"panicked at" in l)
+
+
+def cm_after(held, name):
+    with open(os.path.join(held, name), "rb") as f:
+        lines = f.read().splitlines(True)
+    return lines[[i for i, l in enumerate(lines) if b"panicked at" in l][0] + 1]
+
+
+def snapshot(top):
+    """Every path under `top` with its mode, size, modification time and content hash."""
+    seen = {}
+    for d, dirs, files in os.walk(top):
+        for n in dirs + files:
+            p = os.path.join(d, n)
+            st = os.lstat(p)
+            digest = None
+            if os.path.isfile(p) and not os.path.islink(p):
+                with open(p, "rb") as f:
+                    digest = __import__("hashlib").sha256(f.read()).hexdigest()
+            seen[os.path.relpath(p, top)] = (st.st_mode, st.st_size, st.st_mtime_ns, digest)
+    return seen
+
+
+def safe_dry_run(tmp, mini, finding):
+    finding = tracked(finding)
+
+    # 19. The dry run needs no token and writes nothing: no ledger, no lock, no directory.
+    d = mini("t6", [finding("7400%07d" % 0), hang("7400%07d" % 10, ["invented step 5"])])
+    LOG_NAMES18.extend(d.names)
+    os.unlink(d.token)
+    os.rmdir(d.statedir)
+    before = snapshot(d.tmp)
+    STUB.reset()
+    code, text = d.run("--dry-run")
+    check("a dry run with no token and no ledger directory exits 0 and names what it would file",
+          code == 0 and text.count("would file finding") == 1 and "1 parked" in text, (code, text))
+    check("it sent nothing and changed nothing on disk", STUB.requests == [] and
+          snapshot(d.tmp) == before, STUB.requests)
+    os.mkdir(d.statedir, 0o700)
+    before = snapshot(d.tmp)
+    code, text = d.run("--dry-run")
+    check("with an empty ledger directory it creates no ledger and no lock",
+          code == 0 and snapshot(d.tmp) == before and os.listdir(d.statedir) == [], (code, text))
+    code, text = d.run("--dry-run", "--api", "https://example.com")
+    check("a dry run never builds a GitHub client, so the API address is not even read",
+          code == 0 and STUB.requests == [], (code, text))
+
+    # After a real run, a dry run reads the ledger under a shared lock and writes nothing.
+    write_token(d.token)
+    code, text = d.run()
+    check("the real run still files with a token", code == 0 and len(creates()) == 1, (code, text))
+    d.add([finding("7400%07d" % 20, text="fuzzer: invented other failure here")])
+    LOG_NAMES18.append(d.names[-1])
+    os.unlink(d.token)
+    before = snapshot(d.tmp)
+    STUB.requests = []
+    code, text = d.run("--dry-run")
+    check("a dry run reads the ledger: it names only the new cause",
+          code == 0 and text.count("would file finding") == 1 and "1 filed before" in text and
+          STUB.requests == [], (code, text))
+    check("and leaves the ledger, the lock and everything else untouched",
+          snapshot(d.tmp) == before)
+    code, text = d.run()
+    check("a real run with no token is still refused before anything", code == 3 and
+          STUB.requests == [], (code, text))
+    lk = os.open(d.ledger + ".lock", os.O_RDWR)
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        code, text = d.run("--dry-run")
+    finally:
+        os.close(lk)
+    check("a dry run refuses while a run holds the lock", code == 3 and "lock" in text, text)
+    os.chmod(d.ledger, 0o644)
+    code, text = d.run("--dry-run")
+    check("a dry run refuses a ledger of the wrong mode", code == 3, text)
+    os.chmod(d.ledger, 0o600)
+    outputs.append(d.ledger_text())
+    leaks = sorted({p for p in SEEDS18 + LOG_NAMES18 + ["invented"] for o in outputs if p in o})
+    check("no dry-run output holds a seed, a log name or a message", not leaks, leaks)
 
 
 if __name__ == "__main__":
