@@ -89,8 +89,8 @@ one.
 - It never follows an HTTP redirect, and it talks to `https://api.github.com` and nothing else,
   except plain http to a literal loopback address, which exists for the selftest's stub. It follows a
   listing's `next` link only back to the same listing.
-- It never publishes, edits or closes an advisory. Publishing after a clean rerun is a separate
-  milestone.
+- It never publishes, edits or closes an advisory. A person publishes each advisory after its fix, on a
+  separate machine.
 
 ### Rate
 

@@ -567,8 +567,8 @@ def advisory_body(f):
               % (f["variable"], f["seeds"], f["filter"]))
     description = "\n".join([
         "A finding of nife's continuous fuzz host, filed by fuzz-filer, a program on the host. "
-        "It stays private until its fix is on main and a rerun of its input passes against that "
-        "build, or until 90 days after this report.",
+        "It stays private until a person publishes it after the fix, or until 90 days after "
+        "this report.",
         "",
         "- Finding: %s" % f["finding"],
         "- Class: %s" % f["class"],
