@@ -99,7 +99,9 @@ WANT_PERMISSIONS = "repository_advisories:write"
 TOKEN_MODE = 0o440
 # The token file's owner. The selftest, which cannot make root's files, changes it in process.
 TOKEN_OWNER_UID = 0
-TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_]{1,255}")
+# Same permissive allowlist as fuzz-token (installation tokens are now ghs_APPID_JWT, about 520
+# characters with dots and hyphens); see TOKEN_SHAPE there.
+TOKEN_SHAPE = re.compile(r"(?!-)[A-Za-z0-9_.-]{1,1024}")
 # A token with less than this left is stale: the mint timer runs every 20 minutes and leaves 40.
 MIN_TOKEN_SECONDS = 10 * 60
 # fuzz-token mints one-hour tokens; a file claiming more was not written by it.

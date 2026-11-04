@@ -210,6 +210,10 @@ def run(tmp, keep_server):
             token = "ghs_selftest%d_%s" % (len(state["issued"]), os.urandom(6).hex())
             if mode == "bad-shape":
                 token += " NIFE_FUZZ_PUBLISH=1"
+            if mode == "jwt-shape":
+                # ghs_APPID_JWT: about 520 characters, base64url parts joined by dots.
+                token = "ghs_5571801_" + ".".join(("eyJ-" + os.urandom(60).hex() + "_x")[:170]
+                                                  for _ in range(3))
             state["issued"].append(token)
             perms = dict(body.get("permissions", {}), metadata="read")
             repos = [{"full_name": "nifeos/" + r} for r in body.get("repositories", [])]
@@ -640,7 +644,7 @@ def run(tmp, keep_server):
                                 ("other-repo", "nifeos/basalt", True),
                                 ("no-repos", "no listed repository", True),
                                 ("no-expiry", "expiry", True),
-                                ("bad-shape", "letters, digits and underscores", True),
+                                ("bad-shape", "letters, digits, underscores, hyphens and dots", True),
                                 ("redirect", "redirect", False)):
         if os.path.exists(token_file("publish")):
             os.chmod(token_file("publish"), 0o640)
@@ -674,6 +678,39 @@ def run(tmp, keep_server):
     check("an unknown profile is refused", r.returncode != 0, r.stderr)
     r = helper("profiles")
     check("profiles lists all three", all(p in r.stdout for p in ("publish", "filer", "reader")), r.stdout)
+
+    # 10b. The shape check refuses what could break out of a file, header or command line, and
+    # accepts every documented installation token format, including ones longer than 255.
+    accepted = {
+        "classic ghs_ and 36 characters": "ghs_" + "aB3_" * 9,
+        "255 and more characters": "ghs_" + "a" * 300,
+        "a hyphen": "ghs_abc-def",
+        "a dot": "ghs_123.abc.def",
+        "an underscore": "ghs_abc_def",
+        "ghs_APPID_JWT, 520 characters": "ghs_5571801_" + "eyJ-a_b" * 72 + ".x.y",
+        "1024 characters": "a" * 1024,
+    }
+    for name, tok in accepted.items():
+        check("the shape check accepts %s" % name, bool(MOD.TOKEN_SHAPE.fullmatch(tok)), len(tok))
+    rejected = {
+        "an empty token": "", "a space": "ghs_a b", "a newline": "ghs_a\nb",
+        "a trailing newline": "ghs_ab\n", "a tab": "ghs_a\tb", "a carriage return": "ghs_a\rb",
+        "a NUL": "ghs_a\0b", "a double quote": 'ghs_a"b', "a single quote": "ghs_a'b",
+        "a semicolon": "ghs_a;b", "a backtick": "ghs_a`b", "a dollar": "ghs_a$b",
+        "a backslash": "ghs_a\\b", "a hash": "ghs_a#b", "a pipe": "ghs_a|b",
+        "a leading hyphen": "-ghs_ab", "1025 characters": "a" * 1025,
+        "non-ASCII": "ghs_a\u00e9b",
+    }
+    for name, tok in rejected.items():
+        check("the shape check rejects %s" % name, not MOD.TOKEN_SHAPE.fullmatch(tok), repr(tok))
+    state["mode"] = "jwt-shape"
+    if os.path.exists(token_file("publish")):
+        os.chmod(token_file("publish"), 0o640)
+        os.unlink(token_file("publish"))
+    r = helper("mint", "publish")
+    check("a ghs_APPID_JWT token of about 520 characters is minted and written",
+          r.returncode == 0 and os.path.exists(token_file("publish")), r.stderr)
+    state["mode"] = "ok"
 
     # 11. Nothing holds a secret where it should not.
     secrets = [t for t in state["issued"]] + [j for j in state["jwts"] if j]
