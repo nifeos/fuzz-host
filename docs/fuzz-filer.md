@@ -28,14 +28,14 @@ reads the advisory and never the held directory. `fuzz-filer` is that program.
 3. Reads each held log and names the finding by its content: the first 16 hexadecimal digits of the
    SHA-256 of the log. The same log under two names is one finding.
 4. Groups the findings by cause. A log's signature is its driver, its class, the source file of its
-   panic (without the line number) and the panic's message with the `(replay: ...)` suffix removed
-   and every hexadecimal number, decimal number and bracketed list replaced by a placeholder; the
-   signature's short form is the first 12 hexadecimal digits of the SHA-256 of those four fields.
+   panic (without the line number) and the panic's message with its volatile parts replaced by
+   placeholders (see [Normalization](#normalization)); the signature's short form is the first 12
+   hexadecimal digits of the SHA-256 of those four fields.
    A log with no panic line falls back to its first line that names a panic or carries a replay
    command. A hang has neither, so in their place it takes the last line the guest printed (lines
-   the host itself writes into the log are skipped), normalized the same way: hangs that stopped in
-   different places stay different causes, and hangs that stopped at one place with different
-   numbers are one. Only the oldest log of a signature is filed; the rest are counted in the ledger
+   the host itself writes into the log, and nife's thread dump, are skipped), normalized the same
+   way: hangs that stopped in different places stay different causes, and hangs that stopped at one
+   place with different numbers are one. Only the oldest log of a signature is filed; the rest are counted in the ledger
    and not filed. A signature the ledger or an advisory already covers is not filed again. The
    filer prints signature short forms, kinds and counts, never the file or the message.
 4b. Gives each log a kind and each cause a disposition, below ([Kinds](#kinds)): filed, parked, or
@@ -43,12 +43,33 @@ reads the advisory and never the held directory. `fuzz-filer` is that program.
    count, and nothing is sent for it.
 4a. For each cause not yet covered, reads its window's row from
    `windows.tsv` (driver, commit, class, time) and checks that the log and the row describe the same
-   window. A finding that does not agree is refused by id and age, and the others go on.
+   window. A finding that does not agree is refused, and the others go on. The oldest five
+   refusals of each reason are printed by id and age; past five, one line gives the reason, its
+   count and the ages of its oldest and newest. See [Joining a log to its row](#joining-a-log-to-its-row).
 5. Lists the repository's advisories once and reads each one's `Finding:` line. A finding already
    on GitHub is recorded as filed and never created again, and its whole cause counts as covered. A failed listing files nothing.
 6. Creates one draft advisory per remaining cause, at most `--max` a run, writing `pending` to the ledger before the
    call and `filed` with the advisory id after it, and checks that GitHub's answer is a draft that
    names a package and a range.
+
+### Normalization
+
+The message of one cause changes in every log: seeds, steps, actor numbers, the tick budget's
+measurements, Debug values, addresses. Before it is hashed, in this order:
+
+1. the `(replay: ...)` suffix is removed;
+2. the whole Display of nife's `EveryCoreTickBudget`, `<ms> ms of the counter[ (the backstop)];
+   ticks taken of <n> on each core: core <c> <n> ...`, becomes `<budget>`, so the milliseconds,
+   whether the backstop decided, the budget and the number of online cores never split a cause;
+3. each bracketed list, nested or not, becomes `[list]`;
+4. each braced Debug body, nested or not, becomes `{..}`, and the type name before it stays;
+5. each hexadecimal number, with `0x` or bare (six digits or more, with a digit and a letter), becomes
+   `<hex>`;
+6. each decimal number not glued to a letter becomes `<n>` (`u64` stays).
+
+Every word stays, so two wait sites, two panics and two Debug variants (`Some(Parked)`, `None`)
+stay apart. The thread dump that nife prints after a budget expiry's panic is on later lines and
+never enters the message.
 
 ### Kinds
 
@@ -64,6 +85,20 @@ that ran out of ticks, are as likely the host as the kernel, and a hang's last l
 signature. Each run prints every parked cause by signature, kind and count, and the logs stay in
 the held directory, so the daily report keeps counting them, until a person writes a rule: `file`
 to file it, or `suppress` to set it aside.
+
+### Joining a log to its row
+
+A held log is named `<YYYYMMDDTHHMMSSZ>-<first seed>.log`, the UTC time its window started and its
+first seed. Its row is a line of `windows.tsv` of eight tab-separated fields (`utc`, `driver`,
+`slot`, `first`, `ran`, `ms`, `status`, `commit`) whose `first` equals the name's seed and whose
+`status` is a `held-` class. The time is not part of the join. The filer refuses a log when:
+
+- no such row exists (`windows.tsv holds no held row for it`): the row was never written, was
+  removed, or `windows.tsv` was replaced or truncated since the log was held;
+- two rows for it disagree on driver, commit or class;
+- its row's class is not one this filer knows (`held-finding`, `held-crash`, `held-hang`,
+  `held-budget-expired`), which means the supervisor is newer than the installed filer;
+- its log and its row name different windows, or its replay line does not fit its row.
 
 ### Rules
 
@@ -158,7 +193,7 @@ one.
 ## What it never does
 
 - It never writes a seed, an input, a held log's name, a replay line or an advisory's text to
-  standard output, standard error, the journal or the ledger. Its lines name finding ids, ages,
+  standard output, standard error, the journal or the ledger. Its lines name finding ids, ages, held class names,
   advisory ids, counts and HTTP statuses. A held log's name carries its window's first seed, so it is
   withheld too. Every line passes through a filter that replaces each seed, name and token the run
   has seen, and an error answer to a create prints only GitHub's field names and error codes,
@@ -176,15 +211,18 @@ one.
 
 ### Rate
 
-It creates at most 10 advisories a run (`--max`), one a second, and lists at most 50 pages. It stops
+It creates at most 10 advisories a run (`--max`), one a second, and lists at most 50 pages.
+`--max` may be from 1 to 25 and nothing else, so no run, the first included, creates more than 25.
+The timer starts a run every 30 minutes, so a backlog of causes is filed at most 10 a run. It stops
 the run, exit status 75, when GitHub reports fewer than 100 requests left this hour or answers 403
 or 429 for a rate limit; the next run continues where it stopped. An idle run, with nothing to file,
 sends no request at all.
 
 ### Exit status
 
-0: every finding is filed (parked and suppressed causes are not refusals). 1: something was refused; each refusal is a journal line naming the
-finding id and age. 75: a rate limit stopped the run. 3: a refusal of the whole run (the token, the
+0: every finding is filed (parked and suppressed causes are not refusals). 1: something was
+refused; the oldest five refusals of each reason are journal lines naming the finding id and age,
+and past five, one line counts the reason's findings. 75: a rate limit stopped the run. 3: a refusal of the whole run (the token, the
 rules, the ledger, the held directory or `windows.tsv`), before anything is sent. 4: an internal error, printed
 without its message.
 
@@ -240,7 +278,9 @@ sudo /usr/local/sbin/fuzz-token check filer
 ```
 
 `check` must print `repositories: nifeos/nife`, `permissions: repository_advisories:write` and an
-expiry about an hour ahead. Then install the rules and look before filing:
+expiry about an hour ahead. `sha256sum /usr/local/bin/fuzz-filer ~/fuzz-host/bin/fuzz-filer` must
+print one digest twice: the installed filer is the reviewed one. Then install the rules and look
+before filing:
 
 ```sh
 sudo install -d -o root -g root -m 0755 /usr/local/etc/fuzz-filer
@@ -250,9 +290,13 @@ sudo -u lane env NIFE_FUZZ_HOME=/home/lane/fuzz /usr/local/bin/fuzz-filer run --
 
 The dry run reads no token, sends nothing and writes nothing: no ledger, no lock, no directory. A
 ledger or ledger directory that does not exist yet reads as empty, and it can run at any time,
-beside the timer. It prints one `would file finding <id>` line per cause it would file, one line
-per parked or suppressed cause with its signature, kind and count, each rule that matches no held
-log, and a tally. Write any rule those lines call for (see [Rules](#rules)), install it, and archive
+beside the timer. It prints one `would file finding <id> (held <age>) for cause <signature> (<kind>,
+<count> held logs)` line per cause it would file, one `cause <signature> (<kind>): <count> held logs`
+line per parked or suppressed cause and per filed cause of more than one log, the refusals counted
+per reason, each rule that matches no held log, and a tally of held logs, causes, filed, parked,
+suppressed and refused. A dry run that prints `would file finding <id> (held <age>)` with nothing
+after it, and no `cause` line, is an older filer than this one: compare the installed binary with
+the reviewed commit's (below). Write any rule those lines call for (see [Rules](#rules)), install it, and archive
 what it suppresses:
 
 ```sh
@@ -269,12 +313,15 @@ sudo systemctl start fuzz-filer.service
 
 Verify. After each command, the text after the colon is its expected output:
 
-- `journalctl -u fuzz-filer.service -n 20`: one `filed finding <id> (held <age>) as GHSA-...` line
-  per held finding, and no seed, file name or advisory text.
-- `sudo -u lane /usr/local/bin/fuzz-filer ledger`: one `filed` line per held finding.
-- <https://github.com/nifeos/nife/security/advisories>: one draft per held finding, made by
+- `journalctl -u fuzz-filer.service -n 20`: one `filed finding <id> (held <age>) as GHSA-... for
+  cause <signature> (<count> held logs)` line per cause the dry run named, at most 10 a run, and no
+  seed, file name or advisory text.
+- `sudo -u lane /usr/local/bin/fuzz-filer ledger`: one `filed` line and one `cause` line per filed
+  cause.
+- <https://github.com/nifeos/nife/security/advisories>: one draft per filed cause, made by
   `nife-fuzz[bot]`.
-- `sudo systemctl start fuzz-filer.service` again, then the journal: `none to file`.
+- `sudo systemctl start fuzz-filer.service` again, then the journal: `none to file`, once every
+  cause is filed.
 - `systemctl list-timers fuzz-filer.timer`: the next run within 30 minutes.
 
 If a run fails, `journalctl -u fuzz-filer.service -n 20` names the refusal: the token file (its
@@ -283,7 +330,8 @@ owner, mode, group, profile or age), the ledger, a finding by id, or an HTTP sta
 ## Update or remove
 
 To update, review the new commit and repeat the `checkout`, `script/test` and every `install` line
-(the binary, the units and the rules), then `sudo systemctl daemon-reload`. After a rules change,
+(the binary, the units and the rules), then `sudo systemctl daemon-reload`, and check with
+`sha256sum` that the installed binary is the reviewed one. After a rules change,
 run `archive` as above. To stop filing, `sudo systemctl disable --now
 fuzz-filer.timer`. The ledger stays in `/var/lib/fuzz-filer`; keep it, or a later run relies on the
 listing alone to avoid filing twice.
@@ -299,6 +347,11 @@ listing alone to avoid filing twice.
   or a panic.
 - A hang's cause is the guest's last line alone; two hangs at one place whose last lines differ in
   words are two parked causes.
+- Words stay in a signature, Debug type and variant names included, so a wait site whose message
+  prints `Some(Parked)` in one log and `None` in another is two causes.
+- A change to the normalization re-keys the causes whose messages it touches. A filed finding still
+  covers the cause of its own log while that log is held; a ledger cause line under the old key
+  covers nothing new.
 - Archiving is a person's step: the unit cannot write the fuzz account's home.
 - No one has run it against GitHub or under systemd yet. `systemd-analyze verify` passes on the
   units; the first install confirms the hardening lines leave it working, and the first real create

@@ -1407,11 +1407,11 @@ def volatile_parts_and_refusals(tmp, mini, finding):
     n = mini("u4", [finding("7408%07d" % 0)])
     LOG_NAMES18.extend(n.names)
     spec = finding("7408%07d" % 10)
-    n.add([(spec[0], spec[1], "held-invented-class", spec[3], spec[4])])
+    n.add([(spec[0], spec[1], "held-newer-class", spec[3], spec[4])])
     LOG_NAMES18.append(n.names[-1])
     code, text = n.run("--dry-run")
     check("a row of an unknown held class is refused as such",
-          code == 1 and "its row's class held-invented-class is not one this filer knows" in text
+          code == 1 and "its row's class held-newer-class is not one this filer knows" in text
           and "no held row" not in text, (code, text))
 
     # The cap: --max has a ceiling.
