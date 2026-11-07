@@ -15,13 +15,16 @@ log that has none yet. It is a plain program, not an agent and not a language mo
 - Many held logs share one cause: every log differs in its seed, its timings and its build lines,
   but a driver that trips the same check at the same place prints the same panic. Each log has a
   signature, the driver, the class, the panic's source file without its line number, and the
-  panic's message with the `(replay: ...)` suffix removed and every hexadecimal number, decimal
-  number and bracketed list replaced by a placeholder; its short form is the first 12 hexadecimal
-  digits of the SHA-256 of those four fields. One advisory is filed per signature, for the oldest
+  panic's message with its volatile parts replaced by placeholders (template_of): the `(replay:
+  ...)` suffix removed, the tick budget's whole Display (milliseconds, the backstop, each core's
+  ticks) folded to one, and every bracketed list and braced Debug body (nested or not),
+  hexadecimal number (`0x` or a bare address) and decimal number folded; its short form is the
+  first 12 hexadecimal digits of the SHA-256 of those four fields. One advisory is filed per signature, for the oldest
   held log of it. Later logs with the same signature are not filed; the ledger keeps a count of them
   and the newest commit. A log with no panic line falls back to its first line that names a panic
   or carries a replay command. A hang, which has neither, takes the last line the guest printed in
-  their place, normalized the same way, so hangs that stopped in different places stay apart.
+  their place, normalized the same way and skipping any thread dump, so hangs that stopped in
+  different places stay apart.
 - Each log has a kind: `budget` for a held-budget-expired row, or when its message is the seeded
   drivers' tick budget giving up (whatever its class), `hang` when it has no panic and no replay line, else `replay` (a
   held-finding) or `panic`. Replay and panic causes are filed. Budget and hang causes are parked:
@@ -67,10 +70,10 @@ less than 10 minutes.
 
 It never writes a seed, an input, a held log's name, a panic message or file, a signature's fields
 or an advisory body to standard output, standard error, the journal or the ledger. Its lines name
-finding ids, signature short forms, ages, advisory ids, counts and HTTP statuses. Every message, GitHub's included, passes through a filter that replaces each seed,
+finding ids, signature short forms, ages, advisory ids, held class names, counts and HTTP statuses. Every message, GitHub's included, passes through a filter that replaces each seed,
 held log name and token it has seen.
 
-Rate: it files at most `--max` advisories a run (default 10), one a second, and stops the run when
+Rate: it files at most `--max` advisories a run (default 10, at most 25), one a second, and stops the run when
 GitHub reports fewer than 100 requests left this hour, or answers 403 or 429 for a rate limit; it
 then exits 75 and the next run continues. It follows only `next` links back to the same listing.
 
@@ -81,8 +84,9 @@ directory reads as empty, and the lock, if a run ever made it, is held shared. T
 order is unchanged: the token is checked before anything else is opened. `ledger` prints the ledger's ids, states, advisory ids and ages, and each cause's advisory, count
 and newest commit.
 
-Exit status: 0 when every finding is filed, 1 when anything was refused (each refusal is a journal
-line naming the finding id and age), 75 when a rate limit stopped the run, 3 on a refusal of the
+Exit status: 0 when every finding is filed, 1 when anything was refused (the oldest five of each
+reason are journal lines naming the finding id and age, and past five, one line counts the reason's
+findings and gives the ages of its oldest and newest), 75 when a rate limit stopped the run, 3 on a refusal of the
 whole run (the token, the rules, the ledger, the held directory or windows.tsv) before anything is
 sent, 4 on an internal error. Parked and suppressed causes are not refusals.
 
@@ -104,6 +108,11 @@ BUGS
   EveryCoreTickBudget (BUDGET above). If nife rewords it, such a row is filed as a replay or panic.
 - A hang's cause is one line, the guest's last; two hangs at one place that print different last
   words are two parked causes.
+- Words stay in a signature, Debug type and variant names included: a wait site whose message
+  prints `Some(Parked)` in one log and `None` in another is two causes.
+- A change to template_of re-keys the causes whose messages it touches. A filed finding still
+  covers the cause of its own log while that log is held; a cause line under the old key covers
+  nothing new.
 
 - The count of a crash or hang window is the supervisor's `ask` (1000000), copied here because the
   supervisor records it nowhere. If the supervisor changes it, this copy is wrong until updated.
@@ -158,6 +167,10 @@ LEDGER_MODE = 0o600
 LEDGER_DIR_MODE = 0o700
 
 DEFAULT_MAX = 10
+# The most `--max` may be: no run, the first included, creates more advisories than this.
+MAX_CEILING = 25
+# Refusals of one reason named one by one; past this many, the rest are counted.
+REFUSALS_NAMED = 5
 DEFAULT_PACE = 1.0
 RATE_FLOOR = 100
 MAX_PAGES = 50
@@ -171,6 +184,9 @@ SLOT_LINE = re.compile(rb"continuous-fuzz: slot [0-9]+: ([a-z-]+), seeds from ([
 # held-budget-expired: the guest's own tick budget ran out (nife's supervisor writes it from nife PR
 # #3204 on); its log may carry a replay line or not.
 HELD_CLASSES = ("held-finding", "held-crash", "held-hang", "held-budget-expired")
+# Any held class the supervisor may write, known here or not, so a row of a newer class is refused
+# by its class and not read as no row at all.
+HELD_SHAPE = re.compile(r"held-[a-z-]{1,40}")
 DRIVERS = {
     "kernel-thread": {"variable": "NIFE_SYSCALL_FUZZ_SEEDS", "filter": "seeded_syscalls"},
     "confined": {"variable": "NIFE_CONFINED_FUZZ_SEEDS", "filter": "a_confined_fuzzer"},
@@ -188,18 +204,34 @@ GHSA_ID = re.compile(r"^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$")
 # the older one (`panicked at 'MESSAGE', FILE:L:C`).
 PANIC_AT = re.compile(r"panicked at (?:'(.*)', )?([^\s:']+):[0-9]+(?::[0-9]+)?:?\s*(.*)$")
 REPLAY_SUFFIX = re.compile(r"\s*\(replay:[^)]*\)")
-BRACKETED = re.compile(r"\[[^\]]*\]")
+# The Display of nife's EveryCoreTickBudget (kernel/src/testing.rs), whole: its milliseconds,
+# whether the backstop decided, its tick budget and each online core's ticks. Every part is a
+# measurement of the host's timing, so all of it folds to one placeholder.
+MEASURED_BUDGET = re.compile(r"[0-9]+ ms of the counter(?: \(the backstop\))?; ticks taken of "
+                             r"[0-9]+ on each core:(?: core [0-9]+ [0-9]+)*")
+# The innermost bracketed list and the innermost braced Debug body, folded until none is left, so
+# nested lists and structs of any shape fold to one placeholder each.
+INNER_LIST = re.compile(r"\[[^\[\]]*\]")
+INNER_BRACES = re.compile(r"\{[^{}]*\}")
 HEX_NUMBER = re.compile(r"\b0[xX][0-9a-fA-F]+\b")
+# A bare hexadecimal word of six digits or more with a digit and a letter in it: an address or a
+# hash printed with {:x}. A word with no digit (`deadbeef`, `facade`) stays.
+BARE_HEX = re.compile(r"\b(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{6,}\b")
 DECIMAL_NUMBER = re.compile(r"(?<![A-Za-z_<])[0-9]+(?:\.[0-9]+)?")
 MAX_LINE = 4096
 # Lines the host prints into a window's log, not the guest: a hang's last guest line skips them.
 HOST_LINE = re.compile(rb"^(?:continuous-fuzz:|qemu-bounded\.sh:)")
+# nife's sched::dump_threads block (kernel/src/sched/inspection.rs). The panic handler prints it
+# after a budget expiry, and a watchdog before it exits; it is never a hang's last guest line.
+DUMP_START = re.compile(rb"^\s*--- thread dump")
+DUMP_END = re.compile(rb"^\s*--- end thread dump")
 # The file field of a hang's cause, which no panic line can produce (PANIC_AT's file has no '(').
 HANG_FILE = "(hang)"
 # The seeded drivers' wait gives up with the Display of nife's EveryCoreTickBudget
-# (kernel/src/testing.rs): `<ms> ms of the counter[ (the backstop)]; ticks taken of <n> on each
-# core: core <c> <n> ...`. This matches that text after template_of has normalized it.
-BUDGET = re.compile(r"<n> ms of the counter(?: \(the backstop\))?; ticks taken of <n> on each core")
+# (kernel/src/testing.rs), which template_of folds to this placeholder (MEASURED_BUDGET).
+BUDGET_PLACEHOLDER = "<budget>"
+# The word nife's drivers open every budget expiry's message with (BUDGET_EXPIRED_MARKER there).
+BUDGET_MARKER = "budget-expired:"
 # A log's kind, read from its cause (kind_of): replay, panic, budget or hang. These two are filed
 # when nothing in the rules says otherwise; the others are parked, counted every run and never filed
 # unless a rule says `file`.
@@ -746,7 +778,10 @@ def disposition(rules, f):
 # The findings.
 
 def read_windows(path):
-    """{first seed: [(utc, driver, commit, status)]} for each held row of windows.tsv."""
+    """{first seed: [(utc, driver, commit, status)]} for each held row of windows.tsv: a row whose
+    status is any `held-` class, known to this filer or not (describe refuses one it does not
+    know). The key is the row's fourth field, the window's first seed, which is also the number
+    after the `-` in the held log's name."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as e:
@@ -757,7 +792,7 @@ def read_windows(path):
         rows = {}
         for raw in f:
             parts = raw.decode(errors="replace").rstrip("\n").split("\t")
-            if len(parts) == 8 and parts[6] in HELD_CLASSES and parts[3].isdigit():
+            if len(parts) == 8 and HELD_SHAPE.fullmatch(parts[6]) and parts[3].isdigit():
                 secret(parts[3])
                 rows.setdefault(parts[3], []).append((parts[0], parts[1], parts[7], parts[6]))
     return rows
@@ -796,9 +831,14 @@ def held_logs(held):
             h = hashlib.sha256()
             replay = slot = None
             panic = after = marked = tail = None
+            in_dump = False
             for raw in f:
                 h.update(raw)
-                if raw.strip() and not HOST_LINE.match(raw):
+                if DUMP_START.match(raw):
+                    in_dump = True
+                elif in_dump:
+                    in_dump = not DUMP_END.match(raw)
+                elif raw.strip() and not HOST_LINE.match(raw):
                     tail = raw[:MAX_LINE]
                 if panic is not None and after is None:
                     after = raw[:MAX_LINE]
@@ -817,13 +857,29 @@ def held_logs(held):
     return out, other
 
 
+def fold(pattern, message, mark):
+    """Replace the innermost match of `pattern` by `mark` until none is left."""
+    while True:
+        folded = pattern.sub(mark, message)
+        if folded == message:
+            return message
+        message = folded
+
+
 def template_of(message):
-    """The message with its replay suffix removed and each bracketed list, hexadecimal number and
-    decimal number replaced by a placeholder, so logs that differ only in seeds, timings and counts
-    agree. A number glued to a letter (`u64`) is part of a word and stays."""
+    """The message with its volatile parts replaced by placeholders, so logs that differ only in
+    seeds, timings, counts and addresses agree: the replay suffix goes; the tick budget's whole
+    Display (milliseconds, the backstop, the budget, each core's ticks) becomes `<budget>`; each
+    bracketed list, nested or not, becomes `[list]`; each braced Debug body, nested or not, becomes
+    `{..}` (the type name before it stays); each hexadecimal number, `0x` or bare, becomes `<hex>`;
+    each decimal number becomes `<n>`. A number glued to a letter (`u64`) is part of a word and
+    stays, and so does every word, so different sites and different Debug variants stay apart."""
     message = REPLAY_SUFFIX.sub("", message)
-    message = BRACKETED.sub("[list]", message)
+    message = MEASURED_BUDGET.sub(BUDGET_PLACEHOLDER, message)
+    message = fold(INNER_LIST, message, "\x01").replace("\x01", "[list]")
+    message = fold(INNER_BRACES, message, "\x02").replace("\x02", "{..}")
     message = HEX_NUMBER.sub("<hex>", message)
+    message = BARE_HEX.sub("<hex>", message)
     message = DECIMAL_NUMBER.sub("<n>", message)
     return " ".join(message.split())
 
@@ -855,7 +911,8 @@ def kind_of(status, cause):
     the class, and always for a held-budget-expired row; `hang` when it has no panic and no replay
     line; else `replay` for a held-finding and `panic` for the rest (a hang that panicked first is a
     panic)."""
-    if status == "held-budget-expired" or BUDGET.search(cause[1]):
+    if status == "held-budget-expired" or BUDGET_PLACEHOLDER in cause[1] or \
+            BUDGET_MARKER in cause[1]:
         return "budget"
     if cause[0] == HANG_FILE:
         return "hang"
@@ -882,6 +939,9 @@ def describe(name, digest, replay, slot, windows, cause):
     if len({(r[1], r[2], r[3]) for r in rows}) != 1:
         raise Refusal("windows.tsv holds conflicting held rows for it")
     held_at, driver, commit, status = rows[0]
+    if status not in HELD_CLASSES:
+        raise Refusal("its row's class %s is not one this filer knows; install a filer that knows "
+                      "it" % status)
     if driver not in DRIVERS:
         raise Refusal("its row names an unknown driver")
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
@@ -996,14 +1056,15 @@ def run(args):
 def read_findings(home, ledger, rules, now):
     """(entries, refused, seen, other): one entry per distinct held log that describe accepts,
     oldest first, each (fields, age, mtime, disposition, deciding rule line), and the count of
-    refusals, already reported by finding id and age."""
+    refusals, already reported: the oldest REFUSALS_NAMED of each reason by finding id and age, and
+    past that, one line per reason with its count and the ages of its oldest and newest."""
     held = os.path.join(home, "state", "held")
     logs, other = held_logs(held)
     windows = read_windows(os.path.join(home, "state", "windows.tsv")) if logs else {}
     if other:
         say("the held directory holds %d entries that are not held logs; they are not read"
             % other, err=True)
-    refused, seen, entries, names = 0, set(), [], {}
+    refused, seen, entries, names, reasons = 0, set(), [], {}, {}
     for name, digest, mtime, replay, slot, cause in sorted(logs, key=lambda e: (e[2], e[0])):
         fid = digest[:16]
         age = age_text(now - mtime)
@@ -1018,11 +1079,18 @@ def read_findings(home, ledger, rules, now):
         except Refusal as e:
             if not filed_before:
                 refused += 1
-                say("finding %s (held %s) is refused: %s" % (fid, age, e), err=True)
+                ages = reasons.setdefault(str(e), [])
+                ages.append(age)
+                if len(ages) <= REFUSALS_NAMED:
+                    say("finding %s (held %s) is refused: %s" % (fid, age, e), err=True)
             continue
         f["names"] = names[fid]
         action, line = disposition(rules, f)
         entries.append((f, age, mtime, action, line))
+    for reason, ages in reasons.items():
+        if len(ages) > REFUSALS_NAMED:
+            say("%d findings are refused: %s (held %s to %s; the oldest %d are named above)"
+                % (len(ages), reason, ages[-1], ages[0], REFUSALS_NAMED), err=True)
     return entries, refused, seen, other
 
 
@@ -1095,9 +1163,9 @@ def file_findings(args, github, home, fd, parsed, rules=()):
             % (sig, logs[0][0]["kind"], len(logs), ", ".join(sorted({str(l) for _, l in logs}))))
     if args.dry_run:
         say_unmatched(rules, entries)
-    tally = "%d held logs, %d causes, %d filed before, %d parked, %d suppressed" % (
+    tally = "%d held logs, %d causes, %d filed before, %d parked, %d suppressed, %d refused" % (
         len(seen), len(groups) + len(set(suppressed) - set(groups)), filed, len(parked),
-        sum(len(v) for v in suppressed.values()))
+        sum(len(v) for v in suppressed.values()), refused)
     if not todo:
         say(tally + ", none to file")
         return 1 if refused else 0
@@ -1308,8 +1376,8 @@ def main(argv):
             args.fuzz_home = os.environ.get("NIFE_FUZZ_HOME") or \
                 os.path.join(os.path.expanduser("~"), "fuzz")
     if args.command == "run":
-        if args.max < 1:
-            ap.error("--max must be at least 1")
+        if not 1 <= args.max <= MAX_CEILING:
+            ap.error("--max must be from 1 to %d" % MAX_CEILING)
     try:
         return args.run(args)
     except Refusal as e:

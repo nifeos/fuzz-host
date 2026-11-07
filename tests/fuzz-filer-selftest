@@ -37,6 +37,11 @@ a stub on 127.0.0.1. It checks:
 - the dry run (section 19): with no token and no ledger directory it names what it would file and
   changes nothing on disk; it creates no ledger and no lock, reads an existing ledger, refuses a
   held lock or a ledger of the wrong mode, and a real run without a token is still refused;
+- volatile parts (section 20): budget expiry at one wait site is one cause whatever its
+  measurements, the backstop, the number of cores, nested lists, Debug structs, addresses and the
+  thread dump that follows it, and a real run files one advisory per cause; a thread dump after a
+  hang's last line does not decide its cause; refusals are named five at most per reason, then
+  counted; a row of an unknown held class is refused as such; --max has a ceiling;
 - that nothing the filer printed in any of these runs, and nothing in its ledger, holds a planted
   seed, a held log's name, a replay line or the token, even when GitHub's error message echoes them.
 
@@ -857,6 +862,7 @@ def run_tests(tmp):
 
     kinds_rules_archive(tmp, mini, finding)
     safe_dry_run(tmp, mini, finding)
+    volatile_parts_and_refusals(tmp, mini, finding)
 
     # 16. Nothing printed, and no ledger, holds a seed, a held log's name, a replay line or the
     # token.
@@ -1274,6 +1280,156 @@ def safe_dry_run(tmp, mini, finding):
     outputs.append(d.ledger_text())
     leaks = sorted({p for p in SEEDS18 + LOG_NAMES18 + ["invented"] for o in outputs if p in o})
     check("no dry-run output holds a seed, a log name or a message", not leaks, leaks)
+
+
+def budget_expired(first, k, site="actor", backstop=False, cores=2, driver="kernel-thread",
+                   commit="eee2222"):
+    """A held-budget-expired window as nife's drivers print one: the marker, the site's words, the
+    budget's measurements (`<ms> ms of the counter[ (the backstop)]; ticks taken of <n> on each
+    core: core <c> <n> ...`), and the thread dump after the panic. Every number, list, address and
+    Debug value changes with `k`; the site, the file and the words do not. Invented throughout."""
+    seed = str(int(first) + 7 + k)
+    SEEDS18.extend([first, seed])
+    taken = " ".join("core %d %d" % (c, 31 + k * 13 + c * 5) for c in range(cores))
+    measured = "%d ms of the counter%s; ticks taken of 200 on each core: %s" % (
+        2000 + k * 97, " (the backstop)" if backstop else "", taken)
+    words = ", ".join("[%s]" % ", ".join(str(k + i + j) for j in range(1 + (i + k) % 3))
+                      for i in range(1 + k % 3))
+    if site == "actor":
+        msg = "budget-expired: invented actor %d neither finished nor parked: %s" % (k % 4, measured)
+    elif site == "woken":
+        msg = ("syscall fuzzer: seed 0x%x step %d: budget-expired: Invented { slot: %d, words: "
+               "[%s] } should have woken actor %d with Some(Answer { rets: [%d], at: %x }); it "
+               "stayed parked (%s) (replay: NIFE_SYSCALL_FUZZ_SEEDS=%s:1)"
+               % (0x5eed + k, 3 + k * 7, k, words, k % 3, k * 11, 0xffff8000001a2b00 + k * 0x9c4,
+                  measured, seed))
+    else:
+        msg = "budget-expired: invented fuzzer %d did not exit (%s)" % (k, measured)
+    dump = ["--- thread dump (hang diagnostic; pc* = on-cpu, racy; tour stage %d) ---" % k] + [
+        "  thread %d state=%s pc*=0x%x" % (t, ("Blocked", "Runnable")[(t + k) % 2],
+                                           0x400000 + t * 64 + k)
+        for t in range(2 + k % 3)] + [
+        "  core %d: inbox_len=%d ticks=%d" % (c, k % 2, 900 + k) for c in range(cores)] + [
+        "--- end thread dump ---"]
+    return (first, driver, "held-budget-expired", commit,
+            [slot_line(first, driver), "build: compiled %d crates in %d.%d s" % (100 + k, k, k * 3),
+             "[PANIC] panicked at system_tests/src/user/invented_fuzzer.rs:%d:%d:"
+             % (300 + k * 3, 9 + k), msg] + dump)
+
+
+def hang_with_dump(first, last, k):
+    """A held hang whose guest printed `last`, then a thread dump, then nothing."""
+    spec = hang(first, [last])
+    lines = spec[4][:-1] + [
+        "--- thread dump (hang diagnostic; pc* = on-cpu, racy; tour stage %d) ---" % k,
+        "  thread %d state=Blocked pc*=0x%x" % (k, 0x400000 + k),
+        "--- end thread dump ---", spec[4][-1]]
+    return spec[:4] + (lines,)
+
+
+def volatile_parts_and_refusals(tmp, mini, finding):
+    finding = tracked(finding)
+
+    # 20. A budget expiry's measurements, Debug values, addresses and thread dump vary in every log;
+    # one wait site is one cause. Eight logs at one site, with and without the backstop and on two
+    # and four cores; six at another, with nested lists, structs, an address and a replay line; two
+    # at a third. Each site is one cause, and a fourth, on the other driver, is its own.
+    logs = [budget_expired("7401%07d" % (k * 10), k, backstop=k % 2 == 1, cores=2 + 2 * (k % 2))
+            for k in range(8)]
+    logs += [budget_expired("7402%07d" % (k * 10), k, site="woken") for k in range(6)]
+    logs += [budget_expired("7403%07d" % (k * 10), k, site="exit") for k in range(2)]
+    logs += [budget_expired("7404%07d" % 0, 0, driver="confined")]
+    v = mini("u1", logs)
+    LOG_NAMES18.extend(v.names)
+    STUB.reset()
+    code, text = v.run("--dry-run")
+    budget_lines = [l for l in cause_lines(text).values() if "(budget)" in l]
+    counts = sorted(int(l.split(": ")[1].split(" ")[0]) for l in budget_lines)
+    check("budget expiry at one site is one cause, whatever its measurements, lists, structs, "
+          "addresses and thread dump", code == 0 and counts == [1, 2, 6, 8] and
+          STUB.requests == [], (code, counts, text))
+    check("the dry run prints each parked cause with its short form, kind and count",
+          all(__import__("re").match(r"cause [0-9a-f]{12} \(budget\): [0-9]+ held logs, parked",
+                                     l) for l in budget_lines) and len(budget_lines) == 4, text)
+    check("the dry run's tally counts 17 held logs in four parked causes",
+          "17 held logs, 4 causes" in text and "4 parked" in text, text)
+
+    # A real run with every budget cause turned to `file` files one advisory per cause, not one per
+    # log.
+    write_rules(v.rules, [(s, "file", "any", "2026-11-07", "selftest: file the budget causes")
+                          for s in cause_lines(text)])
+    code, text = v.run()
+    check("a real run files one advisory per budget cause, four for seventeen logs",
+          code == 0 and len(creates()) == 4, (code, len(creates()), text))
+
+    # Normalization, directly.
+    t = MOD.template_of
+    check("the budget's measurements fold: ms, ticks, the backstop and the number of cores",
+          t("w: 2001 ms of the counter; ticks taken of 200 on each core: core 0 200 core 1 3") ==
+          t("w: 19999 ms of the counter (the backstop); ticks taken of 100 on each core: core 0 1 "
+            "core 1 2 core 2 3 core 3 4"))
+    check("nested lists and Debug structs fold to one placeholder each",
+          t("Ok(A { b: [[1, 2], [3]], c: B { d: 4 } })") == t("Ok(A { b: [[9]], c: B { d: 5 } })")
+          and t("Ok(A { b: 1 })") != t("Err(A { b: 1 })"))
+    check("a bare hexadecimal address folds", t("at ffff8000001a2b00 now") == t("at 7fe0c9 now")
+          and t("at ffff8000001a2b00 now") != t("at deadbeef now"))
+    check("a budget message's template is still the budget kind",
+          MOD.kind_of("held-crash", ("-", t("x: 5 ms of the counter; ticks taken of 2 on each "
+                                            "core: core 0 1"))) == "budget")
+
+    # A hang's cause skips a thread dump after its last line: two hangs at one place share a cause,
+    # one elsewhere has its own.
+    h = mini("u2", [hang_with_dump("7405%07d" % 0, "invented step 3 of actor 1", 1),
+                    hang_with_dump("7405%07d" % 10, "invented step 90 of actor 2", 2),
+                    hang_with_dump("7405%07d" % 20, "invented lock wait on slot 4", 3)])
+    LOG_NAMES18.extend(h.names)
+    code, text = h.run("--dry-run")
+    hangs = sorted(l for l in cause_lines(text).values() if "(hang)" in l)
+    check("a thread dump after a hang's last line does not decide its cause",
+          code == 0 and len(hangs) == 2 and any("(hang): 2 held logs" in l for l in hangs), text)
+
+    # Refusals are counted per reason: at most five are named, then a count with the ages.
+    r = mini("u3", [finding("7406%07d" % 0)])
+    LOG_NAMES18.extend(r.names)
+    for k in range(12):
+        first = "7407%07d" % (k * 10)
+        SEEDS18.append(first)
+        LOG_NAMES18.append(held_log(r.held, first, [slot_line(first), "kernel PANIC at x %d" % k]))
+    STUB.reset()
+    code, text = r.run("--dry-run")
+    check("twelve findings with no row: five named, then one count for the reason",
+          code == 1 and text.count("is refused: windows.tsv holds no held row for it") == 5 and
+          "12 findings are refused: windows.tsv holds no held row for it" in text and
+          text.count("would file finding") == 1 and "12 refused" in text, (code, text))
+
+    # A row of a held class this filer does not know is refused by that reason, not as a missing
+    # row, so a newer supervisor shows as such.
+    n = mini("u4", [finding("7408%07d" % 0)])
+    LOG_NAMES18.extend(n.names)
+    spec = finding("7408%07d" % 10)
+    n.add([(spec[0], spec[1], "held-newer-class", spec[3], spec[4])])
+    LOG_NAMES18.append(n.names[-1])
+    code, text = n.run("--dry-run")
+    check("a row of an unknown held class is refused as such",
+          code == 1 and "its row's class held-newer-class is not one this filer knows" in text
+          and "no held row" not in text, (code, text))
+
+    # The cap: --max has a ceiling.
+    for want, value in ((True, str(MOD.MAX_CEILING)), (False, str(MOD.MAX_CEILING + 1))):
+        try:
+            code, text = n.run("--dry-run", "--max", value)
+            ok = True
+        except SystemExit:
+            ok = False
+        check("--max %s is %s" % (value, "accepted" if want else "refused"), ok == want)
+    check("the ceiling is a few dozen at most and the default is under it",
+          MOD.DEFAULT_MAX <= MOD.MAX_CEILING <= 30)
+
+    leaks = sorted({p for p in SEEDS18 + LOG_NAMES18 + ["invented", "Invented", "Answer",
+                                                         "thread dump"]
+                    for o in outputs if p in o})
+    check("no output from section 20 holds a seed, a log name, a message or the dump",
+          not leaks, leaks)
 
 
 if __name__ == "__main__":
