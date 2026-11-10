@@ -863,6 +863,7 @@ def run_tests(tmp):
     kinds_rules_archive(tmp, mini, finding)
     safe_dry_run(tmp, mini, finding)
     volatile_parts_and_refusals(tmp, mini, finding)
+    replayed_ci_shard(mini)
 
     # 16. Nothing printed, and no ledger, holds a seed, a held log's name, a replay line or the
     # token.
@@ -1430,6 +1431,36 @@ def volatile_parts_and_refusals(tmp, mini, finding):
                     for o in outputs if p in o})
     check("no output from section 20 holds a seed, a log name, a message or the dump",
           not leaks, leaks)
+
+
+def replayed_ci_shard(mini):
+    """21. A red CI shard that nife's supervisor replayed (`continuous-fuzz.sh --replay`). Its row
+    carries the slot `replay`, its log's first line names the CI shard and no slot, and a clean
+    replay leaves a `replay-clean` row. The held replay files like any window, from its own row
+    and log; the clean row is neither a finding nor a refusal. Every seed here is invented."""
+    e = mini("r1", [])
+    first, seed, clean_first = "1234500000", "1234500007", "1234400000"
+    with open(os.path.join(e.home, "state", "windows.tsv"), "a") as w:
+        w.write("\t".join(("2026-11-10T01:00:00Z", "kernel-thread", "replay", clean_first,
+                           "27000", "61000", "replay-clean", "fff1111")) + "\n")
+        w.write("\t".join(("2026-11-10T02:00:00Z", "confined", "replay", first, "7", "61000",
+                           "held-finding", "fff2222")) + "\n")
+    held_log(e.held, first, [
+        "continuous-fuzz: replay of CI shard 1: confined, seeds from %s, accelerator kvm, "
+        "image x" % first,
+        "[PANIC] panicked at system_tests/src/user/invented_tests.rs:1:1:",
+        "fuzzer: invented mismatch (replay: NIFE_CONFINED_FUZZ_SEEDS=%s:1)" % seed])
+    STUB.reset()
+    code, text = e.run()
+    posts = creates()
+    check("a replayed CI shard files one advisory and refuses nothing",
+          code == 0 and len(posts) == 1 and " 0 refused," in text, (code, text))
+    d = posts[0][2]["description"] if posts else ""
+    for want in ("- Class: held-finding", "- Driver: confined", "- Commit: fff2222",
+                 "NIFE_CONFINED_FUZZ_SEEDS=%s:1" % seed):
+        check("a replayed CI shard's description holds %r" % want, want in d, d)
+    check("a replayed CI shard's output holds no seed",
+          not any(x in text for x in (first, seed, clean_first)), text)
 
 
 if __name__ == "__main__":
