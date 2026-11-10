@@ -13,6 +13,11 @@ window's log into its held directory, `$NIFE_FUZZ_HOME/state/held/`, mode 0700, 
 an agent, files each held finding as a private security advisory on nifeos/nife, and that a fix lane
 reads the advisory and never the held directory. `fuzz-filer` is that program.
 
+The supervisor also replays a red shard of nife's CI fuzz job (`continuous-fuzz.sh --replay`) and
+holds a reproduction the same way, with the slot `replay` in its row. The filer files it like any
+held window. A clean replay's `replay-clean` row is neither a finding nor a refusal. The selftest
+holds both.
+
 ## What it does
 
 `fuzz-filer run`, started by `fuzz-filer.timer` every 30 minutes:
