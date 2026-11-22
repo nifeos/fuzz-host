@@ -187,9 +187,13 @@ HELD_CLASSES = ("held-finding", "held-crash", "held-hang", "held-budget-expired"
 # Any held class the supervisor may write, known here or not, so a row of a newer class is refused
 # by its class and not read as no row at all.
 HELD_SHAPE = re.compile(r"held-[a-z-]{1,40}")
+# Each driver lists its (replay variable, test filter) pairs, the current spelling first. The held
+# directory keeps logs from before a rename, so an older spelling stays here until no such log is
+# held. The kernel-thread pair was renamed from syscall to system call.
 DRIVERS = {
-    "kernel-thread": {"variable": "NIFE_SYSCALL_FUZZ_SEEDS", "filter": "seeded_syscalls"},
-    "confined": {"variable": "NIFE_CONFINED_FUZZ_SEEDS", "filter": "a_confined_fuzzer"},
+    "kernel-thread": [("NIFE_SYSTEM_CALL_FUZZ_SEEDS", "seeded_system_calls"),
+                      ("NIFE_SYSCALL_FUZZ_SEEDS", "seeded_syscalls")],
+    "confined": [("NIFE_CONFINED_FUZZ_SEEDS", "a_confined_fuzzer")],
 }
 # The supervisor's `ask`: the seed count a window is built with.
 WINDOW_SEEDS = 1000000
@@ -948,12 +952,19 @@ def describe(name, digest, replay, slot, windows, cause):
         raise Refusal("its row's commit is not a commit")
     if slot is not None and (slot.group(1).decode() != driver or slot.group(2).decode() != first):
         raise Refusal("its log and its row name different windows")
-    variable = DRIVERS[driver]["variable"]
+    # Without a replay line the log's own spelling is unknown, so the current pair is used.
+    variable, test_filter = DRIVERS[driver][0]
     if status == "held-finding" and replay is None:
         raise Refusal("its row says held-finding and its log holds no replay line")
     if status in ("held-finding", "held-budget-expired") and replay is not None:
-        if replay.group(1).decode() != variable:
-            raise Refusal("its replay line names another driver's variable")
+        named_variable = replay.group(1).decode()
+        pairs = dict(DRIVERS[driver])
+        if named_variable not in pairs:
+            if any(named_variable == v for other in DRIVERS.values() for v, _ in other):
+                raise Refusal("its replay line names another driver's variable")
+            raise Refusal("its replay line names a variable no driver uses (%s); install a "
+                          "filer that knows it" % named_variable)
+        variable, test_filter = named_variable, pairs[named_variable]
         seed = int(replay.group(2))
         if seed < int(first):
             raise Refusal("its replay seed lies before its window")
@@ -964,7 +975,7 @@ def describe(name, digest, replay, slot, windows, cause):
             "kind": kind_of(status, cause), "started": started,
             "class": status, "driver": driver, "commit": commit,
             "held_at": held_at, "seeds": seeds, "variable": variable,
-            "filter": DRIVERS[driver]["filter"]}
+            "filter": test_filter}
 
 
 def advisory_body(f):

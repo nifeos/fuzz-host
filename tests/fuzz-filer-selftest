@@ -864,6 +864,7 @@ def run_tests(tmp):
     safe_dry_run(tmp, mini, finding)
     volatile_parts_and_refusals(tmp, mini, finding)
     replayed_ci_shard(mini)
+    replay_spellings()
 
     # 16. Nothing printed, and no ledger, holds a seed, a held log's name, a replay line or the
     # token.
@@ -1039,7 +1040,7 @@ def kinds_rules_archive(tmp, mini, finding):
     check("a file rule files each held-budget-expired cause, seeded as its log says",
           code == 0 and len(bodies) == 2 and
           any("NIFE_CONFINED_FUZZ_SEEDS=%s:1 " % seed_r in b and "- Seed: `" in b for b in bodies)
-          and any("NIFE_SYSCALL_FUZZ_SEEDS=%s:1000000 " % first_b in b and "- Seed range" in b
+          and any("NIFE_SYSTEM_CALL_FUZZ_SEEDS=%s:1000000 " % first_b in b and "- Seed range" in b
                   for b in bodies) and
           all("- Class: held-budget-expired" in b for b in bodies), (code, text, bodies))
 
@@ -1461,6 +1462,52 @@ def replayed_ci_shard(mini):
         check("a replayed CI shard's description holds %r" % want, want in d, d)
     check("a replayed CI shard's output holds no seed",
           not any(x in text for x in (first, seed, clean_first)), text)
+
+def replay_spellings():
+    """The kernel-thread driver has two spellings of its replay variable and test filter, from before
+    and after a rename. Both file, each with a reproducer built from its own pair; another driver's
+    variable and one no driver uses are refused, each with its own message. The seed is invented."""
+    log_name = "20261121T180000Z-1000000.log"
+    CAUSE = ("system_tests/src/user/invented_tests.rs", "invented")
+    windows = {"1000000": [("2026-11-21T18:00:00Z", "kernel-thread", "830de0623", "held-finding")]}
+    base = "system call fuzzer: seed 0x6f step 3: a slot differs (replay: %s=1000041:1)"
+
+    def attempt(variable):
+        replay = MOD.REPLAY.search((base % variable).encode())
+        try:
+            return MOD.describe(log_name, "0" * 64, replay, None, windows, CAUSE), None
+        except MOD.Refusal as e:
+            return None, str(e)
+
+    def reproducer(found):
+        for line in MOD.advisory_body(found)["description"].split("\n"):
+            if "cargo xtask test" in line:
+                return line
+        return ""
+
+    base_line = " NIFE_TEST_FILTER_ACROSS_IMAGES=1 cargo xtask test"
+    for variable, test_filter in (("NIFE_SYSTEM_CALL_FUZZ_SEEDS", "seeded_system_calls"),
+                                  ("NIFE_SYSCALL_FUZZ_SEEDS", "seeded_syscalls")):
+        found, refusal = attempt(variable)
+        check("a kernel-thread log naming %s files" % variable, found is not None, refusal)
+        want = "%s=1000041:1 NIFE_TEST_FILTER=%s%s" % (variable, test_filter, base_line)
+        check("its reproducer uses %s and %s" % (variable, test_filter),
+              found is not None and reproducer(found) == want,
+              reproducer(found) if found else refusal)
+    # A row with no replay line takes the current pair.
+    crash_windows = {"1000000": [("2026-11-21T18:00:00Z", "kernel-thread", "830de0623",
+                                  "held-crash")]}
+    found = MOD.describe(log_name, "0" * 64, None, None, crash_windows, CAUSE)
+    check("a range reproducer takes the current spelling",
+          reproducer(found) == "NIFE_SYSTEM_CALL_FUZZ_SEEDS=1000000:1000000 "
+          "NIFE_TEST_FILTER=seeded_system_calls" + base_line, reproducer(found))
+    found, refusal = attempt("NIFE_CONFINED_FUZZ_SEEDS")
+    check("a kernel-thread log naming the confined variable is refused as another driver's",
+          found is None and refusal == "its replay line names another driver's variable", refusal)
+    found, refusal = attempt("NIFE_OTHER_FUZZ_SEEDS")
+    check("a log naming a variable no driver uses is refused with its name",
+          found is None and refusal == "its replay line names a variable no driver uses "
+          "(NIFE_OTHER_FUZZ_SEEDS); install a filer that knows it", refusal)
 
 
 if __name__ == "__main__":
