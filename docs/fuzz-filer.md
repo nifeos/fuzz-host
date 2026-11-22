@@ -168,10 +168,14 @@ on that line, and the replay command runs that seed alone. For a crash, a hang, 
 count, 1000000. The replay command, run in a checkout of the commit, is:
 
 ```sh
-NIFE_SYSCALL_FUZZ_SEEDS=<seed>:1 NIFE_TEST_FILTER=seeded_syscalls NIFE_TEST_FILTER_ACROSS_IMAGES=1 cargo xtask test
+NIFE_SYSTEM_CALL_FUZZ_SEEDS=<seed>:1 NIFE_TEST_FILTER=seeded_system_calls NIFE_TEST_FILTER_ACROSS_IMAGES=1 cargo xtask test
 ```
 
-with `NIFE_CONFINED_FUZZ_SEEDS` and `a_confined_fuzzer` for the confined driver.
+with `NIFE_CONFINED_FUZZ_SEEDS` and `a_confined_fuzzer` for the confined driver. The kernel-thread
+driver was once spelled `NIFE_SYSCALL_FUZZ_SEEDS` and `seeded_syscalls`. The filer accepts either
+spelling in a replay line and builds the replay command from the pair the log used. A row with no
+replay line uses the current pair. A replay line naming another driver's variable is refused, and
+so is one naming a variable no driver uses.
 
 ### The ledger
 
