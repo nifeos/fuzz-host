@@ -195,6 +195,12 @@ DRIVERS = {
                       ("NIFE_SYSCALL_FUZZ_SEEDS", "seeded_syscalls")],
     "confined": [("NIFE_CONFINED_FUZZ_SEEDS", "a_confined_fuzzer")],
 }
+# A window's row is written when the window ends, and its `ms` counts from just after the supervisor
+# names its log, in whole seconds, so the row's `utc` less its `ms` is the log's start time or up to
+# a few seconds after it (0 to 2 s on the fuzz host). Two windows can share a first seed: two slots
+# whose seeds meet, or a slot and a CI replay. When the rows of one seed disagree, the log's own row
+# is the one whose start lies this many seconds after the log's name, or fewer.
+ROW_START_SLACK = 60
 # The supervisor's `ask`: the seed count a window is built with.
 WINDOW_SEEDS = 1000000
 
@@ -782,8 +788,8 @@ def disposition(rules, f):
 # The findings.
 
 def read_windows(path):
-    """{first seed: [(utc, driver, commit, status)]} for each held row of windows.tsv: a row whose
-    status is any `held-` class, known to this filer or not (describe refuses one it does not
+    """{first seed: [(utc, driver, commit, status, ms)]} for each held row of windows.tsv: a row
+    whose status is any `held-` class, known to this filer or not (describe refuses one it does not
     know). The key is the row's fourth field, the window's first seed, which is also the number
     after the `-` in the held log's name."""
     try:
@@ -798,7 +804,8 @@ def read_windows(path):
             parts = raw.decode(errors="replace").rstrip("\n").split("\t")
             if len(parts) == 8 and HELD_SHAPE.fullmatch(parts[6]) and parts[3].isdigit():
                 secret(parts[3])
-                rows.setdefault(parts[3], []).append((parts[0], parts[1], parts[7], parts[6]))
+                rows.setdefault(parts[3], []).append((parts[0], parts[1], parts[7], parts[6],
+                                                      parts[5]))
     return rows
 
 
@@ -929,6 +936,19 @@ def signature_of(driver, status, cause):
     return hashlib.sha256(fields.encode()).hexdigest()[:12]
 
 
+def row_started_with(row, started):
+    """Whether a windows.tsv row is the row of the window whose log's name says it started at
+    `started`: the row's `utc` less its `ms` lies from 0 to ROW_START_SLACK seconds after it. A row
+    whose time or `ms` does not parse is no window's."""
+    try:
+        ended = datetime.strptime(row[0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        ms = int(row[4])
+    except (ValueError, IndexError):
+        return False
+    lead = (ended - started).total_seconds() - ms / 1000.0
+    return 0 <= lead <= ROW_START_SLACK
+
+
 def describe(name, digest, replay, slot, windows, cause):
     """The finding's fields for its advisory, or a Refusal naming what does not agree."""
     named = HELD_NAME.match(name)
@@ -941,8 +961,15 @@ def describe(name, digest, replay, slot, windows, cause):
     if not rows:
         raise Refusal("windows.tsv holds no held row for it")
     if len({(r[1], r[2], r[3]) for r in rows}) != 1:
-        raise Refusal("windows.tsv holds conflicting held rows for it")
-    held_at, driver, commit, status = rows[0]
+        # Another window shares the first seed: keep the rows of the window that started when
+        # this log did.
+        rows = [r for r in rows if row_started_with(r, started)]
+        if not rows:
+            raise Refusal("windows.tsv holds conflicting held rows for it, and none of them "
+                          "started when its log did")
+        if len({(r[1], r[2], r[3]) for r in rows}) != 1:
+            raise Refusal("windows.tsv holds conflicting held rows for it")
+    held_at, driver, commit, status = rows[0][:4]
     if status not in HELD_CLASSES:
         raise Refusal("its row's class %s is not one this filer knows; install a filer that knows "
                       "it" % status)
