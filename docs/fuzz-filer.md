@@ -96,11 +96,17 @@ to file it, or `suppress` to set it aside.
 A held log is named `<YYYYMMDDTHHMMSSZ>-<first seed>.log`, the UTC time its window started and its
 first seed. Its row is a line of `windows.tsv` of eight tab-separated fields (`utc`, `driver`,
 `slot`, `first`, `ran`, `ms`, `status`, `commit`) whose `first` equals the name's seed and whose
-`status` is a `held-` class. The time is not part of the join. The filer refuses a log when:
+`status` is a `held-` class. Two windows can share a first seed: two slots whose seed ranges meet,
+or a slot and a CI replay. When the rows of a seed disagree on driver, commit or class, the time
+decides: a row is written when its window ends, and its `ms` counts from just after the log is
+named, so the log's own row is the one whose `utc` less its `ms` lies from 0 to 60 seconds after
+the time in the log's name (0 to 2 seconds on the fuzz host). The filer refuses a log when:
 
 - no such row exists (`windows.tsv holds no held row for it`): the row was never written, was
   removed, or `windows.tsv` was replaced or truncated since the log was held;
-- two rows for it disagree on driver, commit or class;
+- its rows disagree on driver, commit or class and none of them started when the log did
+  (`windows.tsv holds conflicting held rows for it, and none of them started when its log did`),
+  or more than one did and those disagree (`windows.tsv holds conflicting held rows for it`);
 - its row's class is not one this filer knows (`held-finding`, `held-crash`, `held-hang`,
   `held-budget-expired`), which means the supervisor is newer than the installed filer;
 - its log and its row name different windows, or its replay line does not fit its row.
