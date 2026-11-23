@@ -38,8 +38,9 @@ a stub on 127.0.0.1. It checks:
   changes nothing on disk; it creates no ledger and no lock, reads an existing ledger, refuses a
   held lock or a ledger of the wrong mode, and a real run without a token is still refused;
 - volatile parts (section 20): budget expiry at one wait site is one cause whatever its
-  measurements, the backstop, the number of cores, nested lists, Debug structs, addresses and the
-  thread dump that follows it, and a real run files one advisory per cause; a thread dump after a
+  measurements, the seed it opens with, the backstop, the number of cores, nested lists, Debug
+  structs, addresses and the thread dump that follows it, and a real run files one advisory per
+  cause; a thread dump after a
   hang's last line does not decide its cause; refusals are named five at most per reason, then
   counted; a row of an unknown held class is refused as such; --max has a ceiling;
 - a shared first seed (section 22): two windows of different drivers and commits whose first
@@ -1379,6 +1380,15 @@ def volatile_parts_and_refusals(tmp, mini, finding):
           and t("Ok(A { b: 1 })") != t("Err(A { b: 1 })"))
     check("a bare hexadecimal address folds", t("at ffff8000001a2b00 now") == t("at 7fe0c9 now")
           and t("at ffff8000001a2b00 now") != t("at deadbeef now"))
+    # A budget message that opens with its seed, printed with {:#x} as nife's drivers print it,
+    # folds the seed away: two seeds share one template, and no seed survives into it.
+    seeded = ["budget-expired: seed %#x: invented actor 3 neither finished nor parked: 2%03d ms of "
+              "the counter; ticks taken of 200 on each core: core 0 200 core 1 201" % (s, s % 1000)
+              for s in (0, 0x5eed0417, 0xfffffffffffffffe)]
+    check("a seed printed with {:#x} folds, so seeds share one budget template and none survives",
+          len({t(m) for m in seeded}) == 1 and "0x" not in t(seeded[1]) and
+          "5eed" not in t(seeded[1]) and MOD.kind_of("held-budget-expired", ("-", t(seeded[1])))
+          == "budget", [t(m) for m in seeded])
     check("a budget message's template is still the budget kind",
           MOD.kind_of("held-crash", ("-", t("x: 5 ms of the counter; ticks taken of 2 on each "
                                             "core: core 0 1"))) == "budget")
