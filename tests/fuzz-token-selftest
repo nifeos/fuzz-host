@@ -196,8 +196,10 @@ def run(tmp, keep_server):
                 # An answer that echoes the credential back, as a careless proxy might.
                 return self.reply(401, {"message": "bad credentials: " + jwt})
             if mode == "redirect":
+                # A fixed target: the stub never copies the request into a header.
                 return self.reply(302, {"message": "moved"},
-                                  [("Location", state["decoy"] + self.path)])
+                                  [("Location",
+                                    state["decoy"] + "/app/installations/177641059/access_tokens")])
             verified = verify_jwt(jwt)
             if verified is None:
                 state["bad_jwt"] += 1
@@ -245,7 +247,7 @@ def run(tmp, keep_server):
                 return self.reply(404, {"message": "Not Found"})
             if state["get_redirect"]:
                 return self.reply(302, {"message": "moved"},
-                                  [("Location", state["decoy"] + self.path)])
+                                  [("Location", state["decoy"] + "/installation/repositories")])
             if self.bearer() not in state["issued"]:
                 return self.reply(401, {"message": "Bad credentials"})
             self.reply(200, {"total_count": len(state["repo_listing"]),
