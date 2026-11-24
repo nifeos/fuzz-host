@@ -19,6 +19,6 @@ jobs:
         with:
           persist-credentials: false
       - name: tools
-        run: python3 --version && openssl version && shellcheck --version | head -2
+        run: python3 --version && openssl version && git --version && shellcheck --version | head -2
       - name: script/test
         run: script/test

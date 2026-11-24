@@ -1,0 +1,344 @@
+#!/usr/bin/python3 -IS
+"""tests/fuzz-host-install-rules-selftest: bin/fuzz-host-install-rules against a local bare
+repository and temporary paths.
+
+No network, no GitHub, no key and no root. The test makes a bare repository standing in for
+nifeos/fuzz-host, commits rules files to its main and to a side branch, and runs the program's
+main() with a Config of temporary paths, the copy of bin/fuzz-filer as the installed filer, and a
+stand-in for `fuzz-filer archive` that records how it ran. It checks:
+
+- that the program itself refuses every command line but one 40-digit lowercase commit id, with
+  exit status 2, and refuses a good one when not root, with exit status 3;
+- that a commit on a side branch, and one not in the repository at all, are refused;
+- that the first install writes the commit's rules file, mode 0644, and runs archive once, with
+  the configured environment, from /, with umask 0077;
+- that an install is atomic: the new file is complete in a temporary file in the same directory
+  while the old one is still in place, and a rename puts it there;
+- that a malformed rules file, and a rules file that is a link, are refused by the filer's own
+  reader, leave the old file, leave no temporary file, and run no archive;
+- that a commit older than the one installed is refused;
+- that the filer is refused as the judge when another account could write it;
+- that the journal lines name the commit and the digests before and after, and a refusal;
+- that a failing archive gives exit status 1 after the install;
+- that the account, the environment and the filer path agree with systemd/fuzz-filer.service;
+- that the sudoers drop-ins pass visudo where it is installed, and that the classic one's pattern
+  admits one commit id and nothing more.
+
+Name: provisional.
+"""
+
+import fnmatch
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+PROGRAM = os.path.join(ROOT, "bin", "fuzz-host-install-rules")
+FILER = os.path.join(ROOT, "bin", "fuzz-filer")
+
+failures = []
+
+
+def check(condition, what):
+    if condition:
+        print("ok: %s" % what)
+    else:
+        print("FAIL: %s" % what)
+        failures.append(what)
+
+
+def load(path, name):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+sys.dont_write_bytecode = True
+MOD = load(PROGRAM, "fuzz_host_install_rules")
+
+GIT_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_NAME": "selftest",
+           "GIT_AUTHOR_EMAIL": "selftest@invalid", "GIT_COMMITTER_NAME": "selftest",
+           "GIT_COMMITTER_EMAIL": "selftest@invalid", "GIT_AUTHOR_DATE": "2026-11-24T00:00:00Z",
+           "GIT_COMMITTER_DATE": "2026-11-24T00:00:00Z"}
+
+
+def git(work, *args):
+    return subprocess.run(["git", "-C", work] + list(args), env=GIT_ENV, check=True,
+                          stdout=subprocess.PIPE).stdout.decode().strip()
+
+
+def rules_text(n):
+    return ("# selftest rules %d\n0123456789ab\tsuppress\tstarted-before=2026-11-0%dT00:00:00Z\t"
+            "2026-11-24\tselftest rule %d\n" % (n, n, n)).encode()
+
+
+def commit_rules(work, data=None, link=False, message="rules"):
+    path = os.path.join(work, "etc", "fuzz-filer", "rules.tsv")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.lexists(path):
+        os.unlink(path)
+    if link:
+        os.symlink("/etc/passwd", path)
+    else:
+        with open(path, "wb") as f:
+            f.write(data)
+    git(work, "add", "-A")
+    git(work, "commit", "-q", "-m", message)
+    return git(work, "rev-parse", "HEAD")
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def section_command_line():
+    good = "0" * 40
+    for argv, what in (([], "no argument"), (["0" * 39], "a short commit id"),
+                       (["A" * 40], "an uppercase commit id"), ([good, good], "two arguments"),
+                       (["--help"], "an option"), ([good + " x"], "a commit id with more after it"),
+                       (["--origin=/tmp/x", good], "an option before a commit id"),
+                       (["0" * 64], "a 64-digit id")):
+        p = subprocess.run([PROGRAM] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin"})
+        check(p.returncode == 2 and b"usage:" in p.stderr and not p.stdout,
+              "the program refuses %s with exit status 2" % what)
+    if os.geteuid() != 0:
+        p = subprocess.run([PROGRAM, good], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin"})
+        check(p.returncode == 3 and b"must run as root" in p.stderr,
+              "the program refuses a good commit id when not root, with exit status 3")
+
+
+def section_unit_agrees():
+    unit = {}
+    env = {}
+    with open(os.path.join(ROOT, "systemd", "fuzz-filer.service")) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("Environment="):
+                k, v = line[len("Environment="):].split("=", 1)
+                env[k] = v
+            elif "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                unit[k] = v
+    p = MOD.PRODUCTION
+    check(unit.get("User") == p.archive_user and unit.get("Group") == p.archive_group,
+          "archive runs as fuzz-filer.service's User= and Group=")
+    check(env == dict(p.archive_env), "archive gets fuzz-filer.service's Environment= lines")
+    check(unit.get("ExecStart", "").split()[0] == p.filer == p.archive_argv[0]
+          and p.archive_argv[1:] == ("archive",),
+          "archive runs the filer fuzz-filer.service runs, with the one argument archive")
+
+
+def section_sudoers():
+    classic = os.path.join(ROOT, "etc", "sudoers.d", "fuzz-host-install-rules")
+    rs = classic + ".sudo-rs"
+    for path, tools in ((classic, ("visudo.ws", "visudo")), (rs, ("visudo",))):
+        rules = [l for l in open(path).read().splitlines() if l and not l.startswith("#")]
+        check(len(rules) == 2 and rules[0] == "Defaults!/usr/local/sbin/fuzz-host-install-rules "
+              "env_reset" and rules[1].startswith("lane ALL=(root) NOPASSWD: "
+                                                  "/usr/local/sbin/fuzz-host-install-rules "),
+              "%s grants the one command to lane alone" % os.path.basename(path))
+        for tool in tools:
+            exe = shutil.which(tool, path="/usr/sbin:/usr/bin:/sbin:/bin")
+            if exe is None:
+                continue
+            version = subprocess.run([exe, "--version"], stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT).stdout
+            if (b"sudo-rs" in version) != path.endswith(".sudo-rs") and tool == "visudo":
+                print("skipped: %s is the other sudo; %s is not for it" % (exe, path))
+                continue
+            p = subprocess.run([exe, "-c", "-f", path], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT)
+            check(p.returncode == 0, "%s -c accepts %s" % (exe, os.path.basename(path)))
+    pattern = open(classic).read().splitlines()[-1].rsplit(" ", 1)[1]
+    good = "0123456789abcdef" * 2 + "01234567"
+    check(fnmatch.fnmatchcase(good, pattern), "the classic pattern admits a commit id")
+    for bad in (good[:-1], good + "0", good + " x", good.upper(), "-" + good[1:]):
+        check(not fnmatch.fnmatchcase(bad, pattern),
+              "the classic pattern refuses %r" % bad)
+
+
+def section_install(tmp):
+    origin = os.path.join(tmp, "origin.git")
+    work = os.path.join(tmp, "work")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], env=GIT_ENV, check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", work], env=GIT_ENV, check=True)
+    c1 = commit_rules(work, rules_text(1))
+    c2 = commit_rules(work, rules_text(2))
+    git(work, "checkout", "-q", "-b", "side", c1)
+    side = commit_rules(work, rules_text(3), message="side")
+    git(work, "checkout", "-q", "main")
+    bad = commit_rules(work, b"0123456789ab\tsuppress\tany\t2026-11-24\tno end\n", message="bad")
+    link = commit_rules(work, link=True, message="link")
+    c3 = commit_rules(work, rules_text(4))
+    git(work, "push", "-q", origin, "main", "side")
+    unpushed = commit_rules(work, rules_text(5), message="unpushed")
+
+    etc = os.path.join(tmp, "etc", "fuzz-filer")
+    os.makedirs(etc)
+    os.chmod(etc, 0o755)
+    bindir = os.path.join(tmp, "bin")
+    os.mkdir(bindir)
+    filer = os.path.join(bindir, "fuzz-filer")
+    shutil.copyfile(FILER, filer)
+    os.chmod(filer, 0o555)
+    record = os.path.join(tmp, "archive-runs")
+    fake = os.path.join(bindir, "fake-archive")
+    with open(fake, "w") as f:
+        f.write("#!/usr/bin/python3 -IS\nimport json, os, sys\n"
+                "u = os.umask(0); os.umask(u)\n"
+                "env = dict(os.environ); env.pop('LC_CTYPE', None)\n"  # Python's locale coercion
+                "with open(%r, 'a') as f:\n"
+                "    f.write(json.dumps({'argv': sys.argv[1:], 'env': env, "
+                "'cwd': os.getcwd(), 'umask': u}) + '\\n')\n"
+                "sys.exit(int(os.environ.get('FAKE_STATUS', '0')))\n" % record)
+    os.chmod(fake, 0o755)
+    rules = os.path.join(etc, "rules.tsv")
+    log = []
+    home = os.path.join(tmp, "fuzz")
+    config = MOD.Config(
+        origin=origin, protocols=("file",), state=os.path.join(tmp, "state"), rules=rules,
+        filer=filer, owner_uid=os.geteuid(), owner_gid=os.getegid(),
+        archive_argv=(fake, "archive"), archive_user=None, archive_group=None,
+        archive_env=(("PATH", "/usr/bin:/bin"), ("NIFE_FUZZ_HOME", home)),
+        git=shutil.which("git", path="/usr/bin:/bin"), top=tmp, log=log.append)
+
+    def runs():
+        try:
+            return [json.loads(l) for l in open(record)]
+        except FileNotFoundError:
+            return []
+
+    def leftovers():
+        return [n for n in os.listdir(etc) if n != "rules.tsv"]
+
+    def install(commit, cfg=config):
+        del log[:]
+        return MOD.main([commit], cfg)
+
+    # Not on main.
+    check(install(side) == 3 and not os.path.lexists(rules) and not runs(),
+          "a commit on a side branch is refused, nothing installed, no archive")
+    check(any("refused, rules unchanged: commit %s is not on main" % side in l for l in log),
+          "the refusal of a side commit is logged")
+    check(install(unpushed) == 3 and not os.path.lexists(rules),
+          "a commit not in the repository is refused")
+    check(install("f" * 40) == 3 and not os.path.lexists(rules), "an unknown commit id is refused")
+
+    # The first install.
+    check(install(c1) == 0, "the first install succeeds")
+    check(read(rules) == rules_text(1) and os.stat(rules).st_mode & 0o777 == 0o644,
+          "the first install writes the commit's rules file, mode 0644")
+    check(any(c1 in l and "before none" in l and "after " + sha(rules_text(1)) in l for l in log),
+          "the journal names the commit and the digests before (none) and after")
+    r = runs()
+    check(len(r) == 1 and r[0]["argv"] == ["archive"] and r[0]["cwd"] == "/" and
+          r[0]["umask"] == 0o077 and
+          r[0]["env"] == {"PATH": "/usr/bin:/bin", "NIFE_FUZZ_HOME": home},
+          "archive runs once, from /, umask 0077, with the configured environment alone")
+    check(any("archive exited 0" in l for l in log), "the journal names archive's exit status")
+    check(open(os.path.join(config.state, "installed-commit")).read().strip() == c1,
+          "the installed commit is recorded")
+    st = os.stat(config.state)
+    check(st.st_mode & 0o777 == 0o700, "the state directory is mode 0700")
+
+    # Atomic: the second install, watched at its rename.
+    seen = []
+    real_rename = os.rename
+
+    def watch(src, dst):
+        if dst == rules:
+            seen.append((os.path.dirname(src) == etc, os.path.basename(src),
+                         read(src), read(dst), os.stat(src).st_mode & 0o777))
+        return real_rename(src, dst)
+
+    inode = os.stat(rules).st_ino
+    MOD.os.rename = watch
+    try:
+        status = install(c2)
+    finally:
+        MOD.os.rename = real_rename
+    check(status == 0 and read(rules) == rules_text(2), "the second install succeeds")
+    check(len(seen) == 1 and seen[0][0] and seen[0][1].startswith(".rules.tsv.") and
+          seen[0][2] == rules_text(2) and seen[0][3] == rules_text(1) and seen[0][4] == 0o644,
+          "the new file is complete, mode 0644, beside the old one, which stays until the rename")
+    check(os.stat(rules).st_ino != inode and not leftovers(),
+          "the rename replaces the file and leaves no temporary file")
+    check(any(c2 in l and "before " + sha(rules_text(1)) in l and
+              "after " + sha(rules_text(2)) in l for l in log),
+          "the journal names the digests before and after a change")
+
+    # Malformed and linked rules files.
+    n = len(runs())
+    for commit, what in ((bad, "a malformed rules file"), (link, "a rules file that is a link")):
+        check(install(commit) == 3 and read(rules) == rules_text(2) and not leftovers() and
+              len(runs()) == n, "%s is refused, the old file kept, no archive" % what)
+        check(any("refused, rules unchanged" in l for l in log), "the refusal of %s is logged"
+              % what)
+    install(bad)
+    check(any("installed filer refuses" in l and "not a rule" in l for l in log),
+          "the malformed file is refused by the filer's own reader")
+
+    # Older than installed.
+    check(install(c1) == 3 and read(rules) == rules_text(2),
+          "a commit older than the one installed is refused")
+
+    # A filer another account could write is no judge.
+    os.chmod(filer, 0o575)
+    check(install(c3) == 3 and read(rules) == rules_text(2),
+          "a filer writable by its group is refused as the judge")
+    os.chmod(filer, 0o555)
+
+    # Forward again; the same commit twice; a failing archive.
+    check(install(c3) == 0 and read(rules) == rules_text(4), "a later commit installs")
+    check(install(c3) == 0 and any("(unchanged)" in l for l in log),
+          "the same commit again installs and says unchanged")
+    failing = config._replace(archive_env=config.archive_env + (("FAKE_STATUS", "5"),))
+    check(install(c3, failing) == 1 and any("archive exited 5" in l for l in log),
+          "a failing archive gives exit status 1, and its status is logged")
+    check(all("selftest rule" not in l for l in log), "no journal line carries the rules' text")
+
+    # A commit the clone holds that main no longer reaches: main rewound by a force-push.
+    ahead = commit_rules(work, rules_text(6), message="ahead")
+    git(work, "push", "-q", origin, "main")
+    check(install(ahead) == 0 and read(rules) == rules_text(6), "a commit on main installs")
+    git(work, "push", "-q", "--force", origin, c3 + ":refs/heads/main")
+    check(install(ahead) == 3 and read(rules) == rules_text(6) and
+          any("not main's head or an ancestor" in l for l in log),
+          "a commit the clone holds but main does not reach is refused")
+
+
+def main():
+    os.umask(0o022)
+    section_command_line()
+    section_unit_agrees()
+    section_sudoers()
+    tmp = tempfile.mkdtemp(prefix="fuzz-host-install-rules-selftest.")
+    try:
+        section_install(tmp)
+    finally:
+        shutil.rmtree(tmp)
+    if failures:
+        print("fuzz-host-install-rules-selftest: %d failed" % len(failures), file=sys.stderr)
+        return 1
+    print("fuzz-host-install-rules-selftest: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

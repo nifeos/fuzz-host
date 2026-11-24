@@ -1,0 +1,379 @@
+#!/usr/bin/python3 -IS
+"""fuzz-host-install-rules: install fuzz-filer's rules from a commit on main, then archive.
+
+    sudo fuzz-host-install-rules <commit>
+
+<commit> is a full commit id of nifeos/fuzz-host: 40 lowercase hexadecimal digits, and nothing
+else on the command line. The program runs as root, through one sudo rule that lets the fuzz
+account run it (docs/fuzz-filer.md, "Install a merged rules change"). In order, it:
+
+1. fetches main of nifeos/fuzz-host into a root-owned bare clone, /var/lib/fuzz-host-install-rules/
+   fuzz-host.git, and refuses the commit unless it is main's head or an ancestor of it;
+2. refuses the commit when it is older than the one it last installed: the commit it records in
+   /var/lib/fuzz-host-install-rules/installed-commit must be the given commit or an ancestor of it;
+3. reads etc/fuzz-filer/rules.tsv from that commit, refusing anything but a regular file of at
+   most 1 MiB;
+4. writes it to a temporary file in /usr/local/etc/fuzz-filer, root:root 0644, has the installed
+   filer's own reader (read_rules in /usr/local/bin/fuzz-filer) accept that file, and only then
+   renames it over /usr/local/etc/fuzz-filer/rules.tsv, so the filer sees the old file or the new
+   one and never a part of either;
+5. records the commit, and runs `fuzz-filer archive` as the filer runs: as the account and with the
+   environment fuzz-filer.service names (User=lane, Group=lane, PATH and NIFE_FUZZ_HOME), with no
+   supplementary group and umask 0077.
+
+It logs the caller, the commit, the digest of the rules file before and after, and archive's exit
+status, to the journal through syslog and to standard error. Nothing it handles is secret: the rules
+file is public. It touches nothing else: the filer's binary, the units and every other file stay a
+person's install.
+
+Exit status: 0 installed and archived; 1 installed, but archive failed; 2 a bad command line; 3 a
+refusal, with the rules file left as it was; 4 an internal error.
+
+The program takes no option, reads no environment variable and clears its environment. The
+selftest (tests/fuzz-host-install-rules-selftest) loads it as a module and passes main() a Config of
+temporary paths; no command line can.
+
+Ruled 2026-11-24 (UTC) by the architect: the fuzz account gets this second narrow sudo rule, beside
+`fuzz-token issue reader`.
+
+Name: provisional, as are the paths above and the sudoers file name.
+"""
+
+import collections
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import syslog
+import tempfile
+
+sys.dont_write_bytecode = True
+
+NAME = "fuzz-host-install-rules"
+COMMIT = re.compile(r"[0-9a-f]{40}")
+RULES_IN_REPOSITORY = "etc/fuzz-filer/rules.tsv"
+MAX_RULES_BYTES = 1 << 20
+
+# Where things are, and how archive runs. fuzz-filer.service is the source of the account and the
+# environment; the selftest holds these against systemd/fuzz-filer.service.
+Config = collections.namedtuple("Config", [
+    "origin",         # the repository fetched
+    "protocols",      # the git transports allowed for it
+    "state",          # root-owned directory: the bare clone, the installed commit, the lock
+    "rules",          # the installed rules file
+    "filer",          # the installed filer, whose read_rules judges the new file
+    "owner_uid",      # the owner the state, the rules and the filer must have
+    "owner_gid",      # the rules file's group
+    "archive_argv",   # the archive command
+    "archive_user",   # the account archive runs as, or None to stay this process's
+    "archive_group",
+    "archive_env",    # archive's environment, beside HOME, USER and LOGNAME from the account
+    "git",
+    "top",            # the highest directory check_ancestry looks at: / but in the selftest
+    "log",            # a function taking one line, or None for syslog
+])
+
+FILER = "/usr/local/bin/fuzz-filer"
+PRODUCTION = Config(
+    origin="https://github.com/nifeos/fuzz-host.git",
+    protocols=("https",),
+    state="/var/lib/fuzz-host-install-rules",
+    rules="/usr/local/etc/fuzz-filer/rules.tsv",
+    filer=FILER,
+    owner_uid=0,
+    owner_gid=0,
+    archive_argv=(FILER, "archive"),
+    archive_user="lane",
+    archive_group="lane",
+    archive_env=(("PATH", "/usr/bin:/bin"), ("NIFE_FUZZ_HOME", "/home/lane/fuzz")),
+    git="/usr/bin/git",
+    top="/",
+    log=None,
+)
+
+# git runs with this environment alone: no user or system configuration, no prompt, no proxy.
+GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_ASKPASS": "/bin/false",
+}
+
+
+class Refusal(Exception):
+    """A reason to change nothing, printed for a person without a traceback."""
+
+
+def say(config, line):
+    print("%s: %s" % (NAME, line), file=sys.stderr, flush=True)
+    if config.log is not None:
+        config.log(line)
+    else:
+        syslog.syslog(syslog.LOG_NOTICE, line)
+
+
+def check_private_dir(path, config, mode_mask):
+    """Refuse unless path is a directory, not a link, owned by the owner, with no bit of
+    mode_mask set."""
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        raise Refusal("%s: %s" % (path, e.strerror))
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != config.owner_uid or \
+            stat.S_IMODE(st.st_mode) & mode_mask:
+        raise Refusal("%s must be a directory owned by uid %d with mode %o or narrower, and not a "
+                      "link" % (path, config.owner_uid, 0o777 & ~mode_mask))
+
+
+def check_ancestry(path, config):
+    """Refuse unless path and every directory above it are owned by root or the owner and
+    writable by it alone (or sticky), so no other account can replace what root reads or writes
+    there."""
+    path = os.path.abspath(path)
+    while True:
+        st = os.lstat(path)
+        writable = stat.S_IMODE(st.st_mode) & 0o022 and not st.st_mode & stat.S_ISVTX
+        if stat.S_ISLNK(st.st_mode) or st.st_uid not in (0, config.owner_uid) or writable:
+            raise Refusal("%s must be owned by root and writable by its owner alone" % path)
+        parent = os.path.dirname(path)
+        if path == config.top or parent == path:
+            return
+        path = parent
+
+
+def digest(path):
+    """The SHA-256 of the file at path, `none` if there is none. A link is refused."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "none"
+    except OSError as e:
+        raise Refusal("%s cannot be read: %s (a link is refused)" % (path, e.strerror))
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise Refusal("%s is not a regular file" % path)
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+class Git:
+    def __init__(self, config, git_dir):
+        self.config = config
+        self.git_dir = git_dir
+        allow = ["-c", "protocol.allow=never"]
+        for p in config.protocols:
+            allow += ["-c", "protocol.%s.allow=always" % p]
+        self.prefix = [config.git, "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=",
+                       "-c", "transfer.fsckObjects=true", "-c", "http.followRedirects=false",
+                       "-c", "core.fsmonitor=false"] + allow + ["--git-dir=" + git_dir]
+
+    def run(self, *args, check=True):
+        p = subprocess.run(self.prefix + list(args), env=GIT_ENV, cwd="/", stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if check and p.returncode != 0:
+            last = p.stderr.decode("ascii", "replace").strip().splitlines()[-1:] or ["no message"]
+            raise Refusal("git %s failed (exit %d): %s" % (args[0], p.returncode, last[0]))
+        return p
+
+
+def clone(config):
+    """The bare clone, made if missing, with main fetched as refs/remotes/origin/main."""
+    if not os.path.lexists(config.state):
+        os.mkdir(config.state, 0o700)
+        if config.owner_uid == 0:
+            os.chown(config.state, 0, 0)
+    check_private_dir(config.state, config, 0o077)
+    git_dir = os.path.join(config.state, "fuzz-host.git")
+    if not os.path.lexists(git_dir):
+        subprocess.run([config.git, "init", "--quiet", "--bare", "--template=", git_dir],
+                       env=GIT_ENV, cwd="/", stdin=subprocess.DEVNULL, check=True,
+                       stdout=subprocess.DEVNULL)
+        os.chmod(git_dir, 0o700)
+    check_private_dir(git_dir, config, 0o077)
+    git = Git(config, git_dir)
+    git.run("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
+            config.origin, "+refs/heads/main:refs/remotes/origin/main")
+    return git
+
+
+def is_commit(git, commit):
+    p = git.run("cat-file", "-t", commit, check=False)
+    return p.returncode == 0 and p.stdout.strip() == b"commit"
+
+
+def is_ancestor(git, older, newer):
+    """True when older is newer or an ancestor of it."""
+    p = git.run("merge-base", "--is-ancestor", older, newer, check=False)
+    if p.returncode not in (0, 1):
+        raise Refusal("git merge-base failed (exit %d)" % p.returncode)
+    return p.returncode == 0
+
+
+def rules_at(git, commit):
+    """The bytes of etc/fuzz-filer/rules.tsv at commit; a link, a directory or a large file is
+    refused."""
+    p = git.run("ls-tree", "-z", commit, "--", RULES_IN_REPOSITORY)
+    entry = p.stdout.rstrip(b"\0")
+    m = re.fullmatch(rb"(100644|100755) blob ([0-9a-f]{40,64})\t" + RULES_IN_REPOSITORY.encode(),
+                     entry)
+    if not m:
+        raise Refusal("%s at %s is missing or not a regular file" % (RULES_IN_REPOSITORY, commit))
+    size = int(git.run("cat-file", "-s", m.group(2).decode()).stdout)
+    if size > MAX_RULES_BYTES:
+        raise Refusal("%s at %s is larger than %d bytes" % (RULES_IN_REPOSITORY, commit,
+                                                           MAX_RULES_BYTES))
+    return git.run("cat-file", "blob", m.group(2).decode()).stdout
+
+
+def load_filer(config):
+    """The installed filer as a module, refused unless root owns it and no one else can write it,
+    with its rules owner set to the owner the rules file gets."""
+    check_ancestry(config.filer, config)
+    st = os.lstat(config.filer)
+    if not stat.S_ISREG(st.st_mode):
+        raise Refusal("%s is not a regular file" % config.filer)
+    loader = importlib.machinery.SourceFileLoader("fuzz_filer_installed", config.filer)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    module.RULES_OWNER_UID = config.owner_uid
+    return module
+
+
+def install(config, commit, data):
+    """Write data beside the rules file, have the filer's reader accept it, then rename it into
+    place. On any failure the temporary file goes and the old rules file stays."""
+    d = os.path.dirname(config.rules)
+    check_ancestry(d, config)
+    check_private_dir(d, config, 0o022)
+    filer = load_filer(config)
+    fd, tmp = tempfile.mkstemp(prefix=".rules.tsv.", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchown(f.fileno(), config.owner_uid, config.owner_gid)
+            os.fchmod(f.fileno(), 0o644)
+            os.fsync(f.fileno())
+        try:
+            filer.read_rules(tmp)
+        except filer.Refusal as e:
+            raise Refusal("the installed filer refuses %s at %s: %s" % (RULES_IN_REPOSITORY,
+                                                                        commit, e))
+        os.rename(tmp, config.rules)
+        tmp = None
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if tmp is not None:
+            os.unlink(tmp)
+
+
+def write_record(config, commit):
+    path = os.path.join(config.state, "installed-commit")
+    fd, tmp = tempfile.mkstemp(prefix=".installed-commit.", dir=config.state)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(commit + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            os.unlink(tmp)
+
+
+def read_record(config):
+    """The commit last installed, or None."""
+    path = os.path.join(config.state, "installed-commit")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd) as f:
+        text = f.read(100).strip()
+    if not COMMIT.fullmatch(text):
+        raise Refusal("%s holds no commit; a person mends or removes it" % path)
+    return text
+
+
+def archive(config):
+    env = dict(config.archive_env)
+    kwargs = {}
+    if config.archive_user is not None:
+        pw = pwd.getpwnam(config.archive_user)
+        env.update(HOME=pw.pw_dir, USER=pw.pw_name, LOGNAME=pw.pw_name)
+        kwargs = dict(user=config.archive_user, group=config.archive_group, extra_groups=[])
+    p = subprocess.run(list(config.archive_argv), env=env, cwd="/", stdin=subprocess.DEVNULL,
+                       umask=0o077, **kwargs)
+    return p.returncode
+
+
+def main(argv, config=PRODUCTION):
+    if len(argv) != 1 or not COMMIT.fullmatch(argv[0]):
+        print("usage: %s <commit>, a full commit id of 40 lowercase hexadecimal digits and "
+              "nothing else" % NAME, file=sys.stderr)
+        return 2
+    commit = argv[0]
+    if config is PRODUCTION:
+        if os.geteuid() != 0:
+            print("%s: must run as root, through sudo" % NAME, file=sys.stderr)
+            return 3
+        asker = os.environ.get("SUDO_USER") or "uid %d" % os.getuid()
+        os.environ.clear()
+        os.environ["PATH"] = "/usr/bin:/bin"
+        os.umask(0o022)
+        syslog.openlog(NAME, syslog.LOG_PID, syslog.LOG_AUTH)
+    else:
+        asker = "the selftest"
+    try:
+        say(config, "%s asks to install the rules of commit %s" % (asker, commit))
+        git = clone(config)
+        lock = os.open(os.path.join(config.state, "lock"),
+                       os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not is_commit(git, commit):
+                raise Refusal("commit %s is not on main of %s" % (commit, config.origin))
+            if not is_ancestor(git, commit, "refs/remotes/origin/main"):
+                raise Refusal("commit %s is not main's head or an ancestor of it" % commit)
+            last = read_record(config)
+            if last is not None and not is_ancestor(git, last, commit):
+                raise Refusal("commit %s does not descend from %s, the commit last installed; "
+                              "an older or a side commit is refused" % (commit, last))
+            data = rules_at(git, commit)
+            before = digest(config.rules)
+            after = hashlib.sha256(data).hexdigest()
+            install(config, commit, data)
+            write_record(config, commit)
+            say(config, "installed %s from commit %s as %s: sha256 before %s, after %s%s"
+                % (RULES_IN_REPOSITORY, commit, config.rules, before, after,
+                   " (unchanged)" if before == after else ""))
+        finally:
+            os.close(lock)
+        status = archive(config)
+        say(config, "fuzz-filer archive exited %d" % status)
+        return 0 if status == 0 else 1
+    except Refusal as e:
+        say(config, "refused, rules unchanged: %s" % e)
+        return 3
+    except Exception as e:
+        say(config, "internal error (%s), rules unchanged unless a line above says installed"
+            % type(e).__name__)
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
