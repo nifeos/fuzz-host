@@ -9,15 +9,21 @@ stand-in for `fuzz-filer archive` that records how it ran. It checks:
 
 - that the program itself refuses every command line but one 40-digit lowercase commit id, with
   exit status 2, and refuses a good one when not root, with exit status 3;
-- that a commit on a side branch, and one not in the repository at all, are refused;
+- that a commit not in the repository, a side-branch commit the clone holds, and a commit of main
+  behind its head are each refused as not main's head;
 - that the first install writes the commit's rules file, mode 0644, and runs archive once, with
   the configured environment, from /, with umask 0077;
 - that an install is atomic: the new file is complete in a temporary file in the same directory
   while the old one is still in place, and a rename puts it there;
-- that a malformed rules file, and a rules file that is a link, are refused by the filer's own
-  reader, leave the old file, leave no temporary file, and run no archive;
-- that a commit older than the one installed is refused;
-- that the filer is refused as the judge when another account could write it;
+- that a malformed rules file (by the filer's own reader), a rules file that is a link (by its git
+  mode) and one over 1 MiB are refused, leave the old file, leave no temporary file, and run no
+  archive;
+- that main's head is refused when it is older than the commit installed, and that a corrupt
+  record of the installed commit is refused;
+- that the filer is refused as the judge when another account could write it, and that a valid
+  planted .pyc beside it is never loaded;
+- that a record that cannot be written after the rename is logged with the install it follows,
+  and that a missing rules directory is a refusal, not an internal error;
 - that the journal lines name the commit and the digests before and after, and a refusal;
 - that a failing archive gives exit status 1 after the install;
 - that the account, the environment and the filer path agree with systemd/fuzz-filer.service;
@@ -32,6 +38,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import py_compile
 import os
 import shutil
 import subprocess
@@ -185,9 +192,13 @@ def section_install(tmp):
     git(work, "checkout", "-q", "main")
     bad = commit_rules(work, b"0123456789ab\tsuppress\tany\t2026-11-24\tno end\n", message="bad")
     link = commit_rules(work, link=True, message="link")
+    big = commit_rules(work, b"#" * MOD.MAX_RULES_BYTES + b"\n", message="big")
     c3 = commit_rules(work, rules_text(4))
-    git(work, "push", "-q", origin, "main", "side")
+    git(work, "push", "-q", origin, "side")
     unpushed = commit_rules(work, rules_text(5), message="unpushed")
+
+    def main_at(commit):
+        git(work, "push", "-q", "--force", origin, commit + ":refs/heads/main")
 
     etc = os.path.join(tmp, "etc", "fuzz-filer")
     os.makedirs(etc)
@@ -217,6 +228,8 @@ def section_install(tmp):
         archive_argv=(fake, "archive"), archive_user=None, archive_group=None,
         archive_env=(("PATH", "/usr/bin:/bin"), ("NIFE_FUZZ_HOME", home)),
         git=shutil.which("git", path="/usr/bin:/bin"), top=tmp, log=log.append)
+    clone = os.path.join(config.state, "fuzz-host.git")
+    installed = os.path.join(config.state, "installed-commit")
 
     def runs():
         try:
@@ -231,13 +244,20 @@ def section_install(tmp):
         del log[:]
         return MOD.main([commit], cfg)
 
-    # Not on main.
-    check(install(side) == 3 and not os.path.lexists(rules) and not runs(),
-          "a commit on a side branch is refused, nothing installed, no archive")
-    check(any("refused, rules unchanged: commit %s is not on main" % side in l for l in log),
-          "the refusal of a side commit is logged")
-    check(install(unpushed) == 3 and not os.path.lexists(rules),
-          "a commit not in the repository is refused")
+    def logged(text):
+        return any(text in l for l in log)
+
+    # Not main's head. The side commit is fetched into the clone first, so it is the comparison
+    # with main's head that refuses it, not its absence.
+    main_at(c1)
+    check(install(unpushed) == 3 and not os.path.lexists(rules) and not runs(),
+          "a commit not in the repository is refused, nothing installed, no archive")
+    subprocess.run(["git", "--git-dir=" + clone, "fetch", "-q", origin, "refs/heads/side"],
+                   env=GIT_ENV, check=True)
+    check(git(clone, "cat-file", "-t", side) == "commit", "the clone holds the side commit")
+    check(install(side) == 3 and not os.path.lexists(rules) and not runs() and
+          logged("commit %s is not main's head, %s" % (side, c1)),
+          "a commit on a side branch, held by the clone, is refused as not main's head")
     check(install("f" * 40) == 3 and not os.path.lexists(rules), "an unknown commit id is refused")
 
     # The first install.
@@ -251,11 +271,14 @@ def section_install(tmp):
           r[0]["umask"] == 0o077 and
           r[0]["env"] == {"PATH": "/usr/bin:/bin", "NIFE_FUZZ_HOME": home},
           "archive runs once, from /, umask 0077, with the configured environment alone")
-    check(any("archive exited 0" in l for l in log), "the journal names archive's exit status")
-    check(open(os.path.join(config.state, "installed-commit")).read().strip() == c1,
-          "the installed commit is recorded")
-    st = os.stat(config.state)
-    check(st.st_mode & 0o777 == 0o700, "the state directory is mode 0700")
+    check(logged("archive exited 0"), "the journal names archive's exit status")
+    check(open(installed).read().strip() == c1, "the installed commit is recorded")
+    check(os.stat(config.state).st_mode & 0o777 == 0o700, "the state directory is mode 0700")
+
+    # An ancestor of main's head is refused: installing it could skip a later merged change.
+    main_at(c2)
+    check(install(c1) == 3 and logged("commit %s is not main's head, %s" % (c1, c2)),
+          "a commit on main that is not its head is refused")
 
     # Atomic: the second install, watched at its rename.
     seen = []
@@ -283,44 +306,93 @@ def section_install(tmp):
               "after " + sha(rules_text(2)) in l for l in log),
           "the journal names the digests before and after a change")
 
-    # Malformed and linked rules files.
+    # Older than installed: main rewound to c1, which is then its head.
+    main_at(c1)
+    check(install(c1) == 3 and read(rules) == rules_text(2) and
+          logged("does not descend from %s, the commit last installed" % c2),
+          "main's head is refused when it is older than the commit installed")
+
+    # Malformed, linked and oversized rules files, each refused for its own reason.
     n = len(runs())
-    for commit, what in ((bad, "a malformed rules file"), (link, "a rules file that is a link")):
+    for commit, what, why in (
+            (bad, "a malformed rules file", "the installed filer refuses"),
+            (link, "a rules file that is a link", "is not a regular file (git mode 120000)"),
+            (big, "a rules file over 1 MiB", "is larger than %d bytes" % MOD.MAX_RULES_BYTES)):
+        main_at(commit)
         check(install(commit) == 3 and read(rules) == rules_text(2) and not leftovers() and
               len(runs()) == n, "%s is refused, the old file kept, no archive" % what)
-        check(any("refused, rules unchanged" in l for l in log), "the refusal of %s is logged"
-              % what)
+        check(logged("refused, rules unchanged") and logged(why),
+              "%s is refused because it %s" % (what, why))
+    main_at(bad)
     install(bad)
-    check(any("installed filer refuses" in l and "not a rule" in l for l in log),
+    check(logged("installed filer refuses") and logged("not a rule"),
           "the malformed file is refused by the filer's own reader")
 
-    # Older than installed.
-    check(install(c1) == 3 and read(rules) == rules_text(2),
-          "a commit older than the one installed is refused")
+    # A corrupt record refuses, and nothing changes.
+    main_at(c3)
+    with open(installed, "w") as f:
+        f.write("not a commit\n")
+    check(install(c3) == 3 and read(rules) == rules_text(2) and logged("holds no commit"),
+          "a corrupt record of the installed commit is refused")
+    with open(installed, "w") as f:
+        f.write(c2 + "\n")
 
-    # A filer another account could write is no judge.
+    # The filer is judged from its own checked bytes: a group-writable one is refused, and a
+    # planted .pyc beside it is never read.
     os.chmod(filer, 0o575)
     check(install(c3) == 3 and read(rules) == rules_text(2),
           "a filer writable by its group is refused as the judge")
     os.chmod(filer, 0o555)
+    # A valid .pyc whose header matches the filer's size and time, holding a reader that refuses
+    # everything: an import through the cache would load it.
+    planted = os.path.join(tmp, "planted.py")
+    body = (b"class Refusal(Exception):\n    pass\n"
+            b"def read_rules(path):\n    raise Refusal('planted')\n")
+    size = os.stat(filer).st_size
+    with open(planted, "wb") as f:
+        f.write(body + b"#" * (size - len(body) - 1) + b"\n")
+    st = os.stat(filer)
+    os.utime(planted, ns=(st.st_atime_ns, st.st_mtime_ns))
+    pyc = importlib.util.cache_from_source(filer)
+    os.makedirs(os.path.dirname(pyc))
+    py_compile.compile(planted, cfile=pyc, doraise=True)
+    sys.dont_write_bytecode = True
+    through_cache = load(filer, "fuzz_filer_through_cache")
+    check(not hasattr(through_cache, "rules_parse"),
+          "the planted .pyc is what an import through the cache loads")
 
     # Forward again; the same commit twice; a failing archive.
-    check(install(c3) == 0 and read(rules) == rules_text(4), "a later commit installs")
-    check(install(c3) == 0 and any("(unchanged)" in l for l in log),
+    check(install(c3) == 0 and read(rules) == rules_text(4),
+          "a later commit installs, with a planted .pyc beside the filer ignored")
+    check(install(c3) == 0 and logged("(unchanged)"),
           "the same commit again installs and says unchanged")
     failing = config._replace(archive_env=config.archive_env + (("FAKE_STATUS", "5"),))
-    check(install(c3, failing) == 1 and any("archive exited 5" in l for l in log),
+    check(install(c3, failing) == 1 and logged("archive exited 5"),
           "a failing archive gives exit status 1, and its status is logged")
     check(all("selftest rule" not in l for l in log), "no journal line carries the rules' text")
 
-    # A commit the clone holds that main no longer reaches: main rewound by a force-push.
+    # A record that cannot be written after the rename: the log says the rules are installed.
     ahead = commit_rules(work, rules_text(6), message="ahead")
-    git(work, "push", "-q", origin, "main")
-    check(install(ahead) == 0 and read(rules) == rules_text(6), "a commit on main installs")
-    git(work, "push", "-q", "--force", origin, c3 + ":refs/heads/main")
-    check(install(ahead) == 3 and read(rules) == rules_text(6) and
-          any("not main's head or an ancestor" in l for l in log),
-          "a commit the clone holds but main does not reach is refused")
+    main_at(ahead)
+    real_write = MOD.write_record
+
+    def broken(cfg, commit):
+        raise OSError(28, "No space left on device")
+
+    MOD.write_record = broken
+    try:
+        status = install(ahead)
+    finally:
+        MOD.write_record = real_write
+    check(status == 4 and read(rules) == rules_text(6) and
+          logged("the rules of commit %s are installed, but the record" % ahead) and
+          logged("installed %s from commit %s" % (MOD.RULES_IN_REPOSITORY, ahead)),
+          "a record that cannot be written is logged after the install, which it names")
+
+    # A directory above the rules that cannot be read is a refusal, not an internal error.
+    gone = config._replace(rules=os.path.join(tmp, "missing", "fuzz-filer", "rules.tsv"))
+    check(install(ahead, gone) == 3 and logged("refused, rules unchanged"),
+          "a missing rules directory is a refusal")
 
 
 def main():

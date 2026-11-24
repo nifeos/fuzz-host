@@ -1,4 +1,4 @@
-# fuzz-host-install-rules: the fuzz account may install fuzz-filer's rules from one commit on main
+# fuzz-host-install-rules: the fuzz account may install fuzz-filer's rules from main's head
 # of nifeos/fuzz-host, and nothing else. For sudo-rs, which allows no wildcard inside an argument
 # list, only a trailing `*` for any arguments; the program refuses every command line but one
 # commit id. docs/fuzz-filer.md, "Install a merged rules change", which installs it as
