@@ -15,12 +15,17 @@ private key, so the rules below are stricter than a library's.
   stay out of this repository. The maintainers keep them off-tree. Write instructions for any
   reader: "the fuzz host", "your machine".
 - No lane opens, reads, copies or looks for a real key or a real token, and no lane runs anything on
-  the fuzz host. A person installs what this repository ships. Selftests make their own throwaway
-  keys and talk to a local stub, never to GitHub.
+  the fuzz host. Two narrow sudo commands are the only exceptions: `fuzz-token issue reader`, on
+  the machine that launches fix lanes ([docs/fuzz-token-reader.md](docs/fuzz-token-reader.md)), and
+  `fuzz-host-install-rules <commit>`, on the fuzz host, which installs the rules file of a commit
+  on main and archives (ruled 2026-11-24, [docs/fuzz-filer.md](docs/fuzz-filer.md#install-a-merged-rules-change)).
+  A person installs what this repository ships, those two programs included. Selftests make their
+  own throwaway keys and repositories and talk to a local stub, never to GitHub.
 - A helper that holds a secret never puts it in argv, in the journal, in an error message or on
   standard output. A selftest proves that for each one. The single exception is `fuzz-token issue reader`, which writes a one-hour
   advisory-read token to a pipe for the lane that asked ([docs/fuzz-token-reader.md](docs/fuzz-token-reader.md)).
-- Python's standard library and the `openssl` binary are the dependencies. Any other one needs an
+- Python's standard library and the `openssl` binary are the dependencies, and `git`, which
+  `fuzz-host-install-rules` runs for the clone the 2026-11-24 ruling names. Any other one needs an
   architect's ruling first.
 
 ## What gates this repository
