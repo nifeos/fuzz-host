@@ -356,10 +356,14 @@ units stay a person's install.
 `sudo fuzz-host-install-rules <commit>`:
 
 1. refuses every command line but one commit id of 40 lowercase hexadecimal digits;
-2. fetches main of `https://github.com/nifeos/fuzz-host.git` into a bare clone it keeps,
+2. takes a lock beside its clone, so two runs never overlap, and fetches main of
+   `https://github.com/nifeos/fuzz-host.git` with `/usr/bin/git` into a bare clone it keeps,
    root-owned and mode 0700, at `/var/lib/fuzz-host-install-rules/fuzz-host.git`, with no user or
-   system git configuration, no hook and no credential, and refuses the commit unless it is
-   main's head or an ancestor of it;
+   system git configuration, no hook, no credential and no automatic garbage collection or
+   maintenance. It refuses the commit unless it is main's head as just fetched. The ruling allows
+   main's head or an ancestor of it; the program takes the stricter bound, because an older
+   commit of main would let a run install one merged rules change and skip a later one that
+   corrects it;
 3. refuses the commit unless the one it last installed, recorded in
    `/var/lib/fuzz-host-install-rules/installed-commit`, is that commit or an ancestor of it, so an
    older rules file, or one from a side branch, never replaces a newer one. A rules file a person
@@ -371,20 +375,22 @@ units stay a person's install.
    `/usr/local/etc/fuzz-filer/rules.tsv`. A timer run in between reads the old file or the new one,
    never a part. On a refusal the old file stays and nothing else happens;
 6. runs `/usr/local/bin/fuzz-filer archive` as `fuzz-filer.service` names: as `lane`, group `lane`
-   and no other group, with `PATH=/usr/bin:/bin` and `NIFE_FUZZ_HOME=/home/lane/fuzz` and nothing
-   else from root's environment, from `/`, with umask 0077.
+   and no other group, with `PATH=/usr/bin:/bin` and `NIFE_FUZZ_HOME=/home/lane/fuzz`, and
+   `HOME`, `USER` and `LOGNAME` from `lane`'s passwd entry, as systemd sets them for `User=`, and
+   nothing else from root's environment, from `/`, with umask 0077.
 
 It writes nothing but the rules file, its clone, its record and a lock beside them. Each run logs
 to the journal (`journalctl -t fuzz-host-install-rules`) and to standard error: who asked, the
 commit, the rules file's SHA-256 before and after (`none` before the first), a refusal's reason,
 and archive's exit status. Nothing it handles is secret. Exit status: 0 installed and archived; 1
 installed, but archive failed; 2 a bad command line; 3 refused, the old rules file kept; 4 an
-internal error.
+internal error, or rules installed whose record could not be written (a line says which, and no
+archive ran).
 
 ### How a maintainer installs a rules change
 
-After the rules pull request merges, as the fuzz account on the fuzz host, with the commit main
-now holds (the merge commit, or any later commit of main):
+After the rules pull request merges, as the fuzz account on the fuzz host, with the commit at
+main's head now, which holds every merged rules change (a commit behind the head is refused):
 
 ```sh
 git ls-remote https://github.com/nifeos/fuzz-host.git refs/heads/main
@@ -398,8 +404,10 @@ held log. Nothing more is needed: the next timer run reads the new rules.
 
 ### The one-time install, for a person with root on the fuzz host
 
-Do this after the filer and its rules are installed (above). Fetch this repository into your own
-account and review the commit you install, as above.
+Do this after the filer and its rules are installed (above). The program needs `/usr/bin/git`,
+which it runs by that path alone; install the distribution's `git` package first if `ls -l
+/usr/bin/git` finds none. Fetch this repository into your own account and review the commit you
+install, as above.
 
 ```sh
 git -C ~/fuzz-host fetch origin
@@ -409,7 +417,15 @@ ls -ld /usr /usr/local /usr/local/sbin /usr/local/bin /usr/local/etc /usr/local/
 sudo install -o root -g root -m 0555 ~/fuzz-host/bin/fuzz-host-install-rules \
     /usr/local/sbin/fuzz-host-install-rules
 sudo --version | head -1
+sudo -n env | sort
 ```
+
+`sudo --version` names the sudo the host has, which picks the drop-in below. `sudo -n env` shows
+what survives sudo's environment reset on this host: expect `HOME`, `PATH` (sudo's
+`secure_path`), the `SUDO_` variables, and little more, with no `PYTHON`, `GIT_` or `LD_` variable.
+The program clears its own environment before it does anything and starts Python with `-IS`, so a
+variable that survives changes nothing; the check is that the host's sudo is the one this page
+describes.
 
 The `ls` must show `root` as owner of each directory and no `w` in its group or other columns: the
 program runs as root at the fuzz account's request, and it reads and loads the installed filer, so
@@ -455,7 +471,7 @@ To update the program, review the new commit and repeat the `checkout`, `script/
 To update, review the new commit and repeat the `checkout`, `script/test` and every `install` line
 (the binary, the units and the rules), then `sudo systemctl daemon-reload`, and check with
 `sha256sum` that the installed binary is the reviewed one. A rules change alone needs none of
-that: install it with `fuzz-host-install-rules` (below), which also archives. To stop filing, `sudo systemctl disable --now
+that: install it with `fuzz-host-install-rules` (above), which also archives. To stop filing, `sudo systemctl disable --now
 fuzz-filer.timer`. The ledger stays in `/var/lib/fuzz-filer`; keep it, or a later run relies on the
 listing alone to avoid filing twice.
 
@@ -489,9 +505,10 @@ listing alone to avoid filing twice.
 - The fuzz account can plant a log in its own held directory, and the filer files it as a private
   draft. That reaches no one outside the repository's security managers.
 - Python cannot wipe memory, so the token stays in the process's heap until it exits.
-- `fuzz-host-install-rules` loads the installed filer's code into a root process to check a rules
-  file with the filer's own reader. That code is a person's install, root-owned, and the program
-  refuses it when another account could write it or a directory above it.
+- `fuzz-host-install-rules` runs the installed filer's code in a root process to check a rules
+  file with the filer's own reader. That code is a person's install, root-owned; the program opens
+  it without following a link, refuses it when another account could write it or a directory
+  above it, and compiles the bytes it checked, never a cached `.pyc`.
 - Under sudo-rs, the sudo rule cannot fix the argument; the program alone refuses anything but one
   commit id.
 - `fuzz-host-install-rules` knows only the commits it installed itself: a rules file installed by

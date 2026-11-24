@@ -16,7 +16,7 @@ The maintainers keep the host's own specification (its name, address and hardwar
 |---|---|
 | `bin/fuzz-token` | mints one narrowed one-hour installation token of the fuzz host's GitHub App per service, from the App's root-only key ([docs/fuzz-token.md](docs/fuzz-token.md), with the install steps); its `reader` profile gives a fix lane, on the machine that launches it, a one-hour token that reads advisories ([docs/fuzz-token-reader.md](docs/fuzz-token-reader.md)) |
 | `bin/fuzz-filer` | files one private security advisory on nifeos/nife per held fuzz finding, with the `filer` token ([docs/fuzz-filer.md](docs/fuzz-filer.md), with the install steps) |
-| `bin/fuzz-host-install-rules` | installs `etc/fuzz-filer/rules.tsv` from a commit on main and runs `fuzz-filer archive`, through one narrow sudo rule for the fuzz account ([docs/fuzz-filer.md](docs/fuzz-filer.md#install-a-merged-rules-change), with the install steps) |
+| `bin/fuzz-host-install-rules` | installs `etc/fuzz-filer/rules.tsv` from main's head and runs `fuzz-filer archive`, through one narrow sudo rule for the fuzz account ([docs/fuzz-filer.md](docs/fuzz-filer.md#install-a-merged-rules-change), with the install steps) |
 | `etc/sudoers.d/` | that sudo rule, one file for classic sudo and one for sudo-rs |
 | `etc/fuzz-filer/rules.tsv` | the filer's reviewed rules: which causes it never files, and which parked causes it files ([docs/fuzz-filer.md](docs/fuzz-filer.md#rules)) |
 | `systemd/` | `fuzz-token@.service` and `fuzz-token@.timer`, one instance per service; `fuzz-filer.service` and `fuzz-filer.timer` |
