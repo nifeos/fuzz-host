@@ -72,7 +72,7 @@ from datetime import datetime, timedelta, timezone
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 FILER = os.path.join(ROOT, "bin", "fuzz-filer")
 MY_GROUP = grp.getgrgid(os.getegid()).gr_name
-ADV = "/repos/nifeos/nife/security-advisories"
+ADV = "/repos/partsfoundry/nife/security-advisories"
 
 # Planted values. No real window starts this low or this oddly; the test greps every output for them.
 FIRSTS = {"finding": "73914000000", "crash": "73915000000", "hang": "73916000000",
@@ -162,7 +162,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.server_address[0], self.server.server_address[1], ADV,
                 start + STUB.page_size)
             if STUB.mode == "evil-next":
-                nxt = "http://%s:%d/repos/nifeos/other/security-advisories?after=%d" % (
+                nxt = "http://%s:%d/repos/partsfoundry/other/security-advisories?after=%d" % (
                     self.server.server_address[0], self.server.server_address[1],
                     start + STUB.page_size)
             headers.append(("Link", '<%s>; rel="next"' % nxt))
@@ -245,7 +245,7 @@ def shape_checks():
         check("the filer's shape check rejects a %s token" % name, not MOD.TOKEN_SHAPE.fullmatch(tok))
 
 
-def write_token(path, perms="repository_advisories:write", repos="nifeos/nife", minutes=50,
+def write_token(path, perms="repository_advisories:write", repos="partsfoundry/nife", minutes=50,
                 mode=0o440):
     if os.path.lexists(path):
         os.chmod(path, 0o600) if not os.path.islink(path) else None
@@ -580,8 +580,8 @@ def run_tests(tmp):
     env8 = Env(os.path.join(tmp, "h"))
     cases = [
         ("the wrong profile", dict(perms="contents:write")),
-        ("another repository", dict(repos="nifeos/basalt")),
-        ("two repositories", dict(repos="nifeos/nife,nifeos/basalt")),
+        ("another repository", dict(repos="partsfoundry/basalt")),
+        ("two repositories", dict(repos="partsfoundry/nife,partsfoundry/basalt")),
         ("a stale token", dict(minutes=5)),
         ("an expired token", dict(minutes=-5)),
         ("too long a life", dict(minutes=600)),

@@ -4,7 +4,7 @@
 the key path `/etc/nife-fuzz-reader/nife-fuzz-reader.private-key.pem` and the sudoers file name
 `fuzz-token-reader`.*
 
-A held finding reaches the lane that fixes it only as a private security advisory on nifeos/nife.
+A held finding reaches the lane that fixes it only as a private security advisory on partsfoundry/nife.
 The lane reads that advisory with a token of the `nife-fuzz-reader` GitHub App (App ID 5571868,
 installation ID 177642435; neither is secret), which holds Repository security advisories read and
 nothing else. The App's key sits on the machine that launches fix lanes, in a file only root can
@@ -17,7 +17,7 @@ names its id, its installation and its key path.
 
 | profile | App | permissions | reaches |
 |---|---|---|---|
-| `reader` | `nife-fuzz-reader` | Repository security advisories read | nifeos/nife alone |
+| `reader` | `nife-fuzz-reader` | Repository security advisories read | partsfoundry/nife alone |
 
 GitHub adds Metadata read to every token. If GitHub grants anything else, write in place of read,
 or another repository, the helper revokes the token and prints nothing on standard output.
@@ -94,7 +94,7 @@ fallback and needs nothing but its install steps.
 **What this does not isolate.** Ruled 2026-11-03: any lane on the machine may take a reader token,
 and the split of accounts is revisited after the first fix lane runs. Every lane runs as the same account, so any lane on the machine can
 ask for a reader token, not only the fix lane for one advisory, and the token reads every advisory
-on nifeos/nife. The protection is that the key stays root's and the token lives an hour. It also
+on partsfoundry/nife. The protection is that the key stays root's and the token lives an hour. It also
 holds only if the lane account cannot become root another way: an account with general sudo
 rights, or a cached sudo credential, can read the key directly. Run lanes under an account with no
 other sudo rule.
@@ -105,7 +105,7 @@ Do this after `fuzz-token` itself merges, and before the key is placed. Fetch th
 your own account and review the commit you install.
 
 ```sh
-git clone https://github.com/nifeos/fuzz-host.git ~/fuzz-host
+git clone https://github.com/partsfoundry/fuzz-host.git ~/fuzz-host
 git -C ~/fuzz-host checkout --detach <the commit you reviewed>
 ~/fuzz-host/script/test
 sudo install -d -o root -g 0 -m 0755 /usr/local/sbin
@@ -124,7 +124,7 @@ somewhere root owns instead, and use that path in the rule below.
 
 ### Place the key
 
-1. At <https://github.com/organizations/nifeos/settings/apps/nife-fuzz-reader>, under Credentials,
+1. At <https://github.com/organizations/partsfoundry/settings/apps/nife-fuzz-reader>, under Credentials,
    Key pairs, generate a private key. Note the SHA256 fingerprint GitHub shows beside it. Run
    `chmod 600` on the download at once.
 2. Move it into place and remove the download:
@@ -176,9 +176,9 @@ After each command, the text after the colon is its expected output:
   no rule that grants anything more.
 - `sudo /usr/local/sbin/fuzz-token check reader --fresh`, as yourself: `app: nife-fuzz-reader (App
   ID 5571868, installation 177642435)`, `permissions: metadata:read,repository_advisories:read`,
-  `repositories: nifeos/nife`, an `expires:` line about an hour ahead, `revoked: yes`, and exit
+  `repositories: partsfoundry/nife`, an `expires:` line about an hour ahead, `revoked: yes`, and exit
   status 0. It mints a token, asks GitHub which repositories it reaches, revokes it, and never
-  prints it. It fails unless the list is exactly nifeos/nife and the revocation succeeded; the mint
+  prints it. It fails unless the list is exactly partsfoundry/nife and the revocation succeeded; the mint
   itself refuses any permission but advisories read.
 - As the lane account, `sudo -n /usr/local/sbin/fuzz-token issue reader | wc -c`: a number near 41
   (the token and its newline), and one `issued one reader token` line on standard error.
@@ -188,8 +188,8 @@ After each command, the text after the colon is its expected output:
   denied.
 
 If `check` lists another repository, open the installation's settings page,
-<https://github.com/organizations/nifeos/settings/installations/177642435>, and set Only select
-repositories to nifeos/nife alone. If the mint refuses a permission, the App's permissions changed:
+<https://github.com/organizations/partsfoundry/settings/installations/177642435>, and set Only select
+repositories to partsfoundry/nife alone. If the mint refuses a permission, the App's permissions changed:
 set them back to Repository security advisories, Read-only, on the App's settings page.
 
 ### Update or remove
@@ -217,7 +217,7 @@ To retire the key, delete it on the App's settings page and `sudo rm -P` (or `sh
   directory: check with `ls -lde /etc/nife-fuzz-reader` and `sudo ls -le` on the key that no ACL
   line follows.
 - Any lane on the machine can take a reader token, since every lane runs as one account, and the
-  token reads every advisory on nifeos/nife (see above).
+  token reads every advisory on partsfoundry/nife (see above).
 - A lane can ask as often as it likes. Each request mints a new token, and GitHub's rate limit on
   the App is the only bound.
 - Python cannot wipe memory, so the key and the token stay in the helper's heap until it exits, a

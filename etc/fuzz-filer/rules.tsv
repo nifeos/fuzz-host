@@ -16,19 +16,19 @@
 # Name: provisional, as are the path, the actions and the scopes.
 00b08ba7777d	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a kernel-thread driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
 1e3d44196672	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a kernel-thread driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
-360174eb1a50	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025, which opens this wait's message with its seed
+360174eb1a50	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025, which opens this wait's message with its seed
 557dc4a3b42d	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a kernel-thread driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
 7ff5ae1848ab	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a kernel-thread driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
-9216849023e4	suppress	started-before=2026-12-08T00:00:00Z	2026-11-24	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
+9216849023e4	suppress	started-before=2026-12-08T00:00:00Z	2026-11-24	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025
 afb277042846	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a kernel-thread driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
-c8ea6c71d274	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
-c96bea4f6081	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
+c8ea6c71d274	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025
+c96bea4f6081	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025
 07178cf58e77	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
 13f4b8327f0d	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
-19f6ce2d491a	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025, which opens this wait's message with its seed
-1fc0510a81e1	suppress	started-before=2026-12-08T00:00:00Z	2026-11-24	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
-3c997b1182be	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
-7adfeea715f4	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
+19f6ce2d491a	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025, which opens this wait's message with its seed
+1fc0510a81e1	suppress	started-before=2026-12-08T00:00:00Z	2026-11-24	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025
+3c997b1182be	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025
+7adfeea715f4	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see partsfoundry/nife#4025
 9757d7187611	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
 b5a849d6d7ae	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
 c500ed04a424	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere

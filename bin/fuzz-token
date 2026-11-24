@@ -14,7 +14,7 @@ lanes. The App's id, installation id and key path come from the profile.
 
 `mint` reads the App's private key from a root-only file, signs a JSON Web Token (RS256, through
 the `openssl` binary, the key handed over on a pipe), and exchanges it for an installation token
-that holds only the profile's permissions on nifeos/nife alone and lives one hour. It refuses the
+that holds only the profile's permissions on partsfoundry/nife alone and lives one hour. It refuses the
 answer, and revokes the token, when GitHub grants more than it asked for or any other repository.
 It writes the token to `<out-dir>/<profile>.env`, owned by root and by the profile's group, mode
 0440, in a form both a shell and systemd's `EnvironmentFile=` read. The group must hold the reader
@@ -25,7 +25,7 @@ root's:
     GH_TOKEN=...
     GH_TOKEN_EXPIRES_AT=2026-11-03T14:00:00Z
     GH_TOKEN_PERMISSIONS=contents:write
-    GH_TOKEN_REPOSITORIES=nifeos/nife
+    GH_TOKEN_REPOSITORIES=partsfoundry/nife
 
 `fuzz-token@<profile>.timer` runs `mint` every 20 minutes, so a reader always holds a token with
 at least 40 minutes left.
@@ -39,9 +39,9 @@ has the rule.
 
 `check` reads that file, asks GitHub which repositories the token reaches, and prints the list,
 the expiry and the recorded permissions. It never prints the token. It exits 1 unless the list is
-exactly nifeos/nife and the token is unexpired. `check --fresh` reads the key instead, mints a
+exactly partsfoundry/nife and the token is unexpired. `check --fresh` reads the key instead, mints a
 token, prints the permissions GitHub granted, the repositories it reaches and its expiry, revokes it,
-and exits 1 unless the list is exactly nifeos/nife and the revocation succeeded. `mint` and `issue`
+and exits 1 unless the list is exactly partsfoundry/nife and the revocation succeeded. `mint` and `issue`
 have already refused any grant but the profile's permissions.
 
 `profiles` prints each profile, its permissions, its default reader and its default group.
@@ -97,7 +97,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-OWNER = "nifeos"
+OWNER = "partsfoundry"
 REPOSITORY = "nife"
 FULL_NAME = OWNER + "/" + REPOSITORY
 
@@ -351,7 +351,7 @@ def parse_expiry(text):
 
 def exchange(api, jwt, profile):
     """(token, expires_at, granted permissions) narrowed to the profile's permissions on
-    nifeos/nife alone."""
+    partsfoundry/nife alone."""
     wanted = PROFILES[profile]["permissions"]
     _, minted = call(api, "POST",
                      "/app/installations/%s/access_tokens" % app_of(profile)["installation_id"],

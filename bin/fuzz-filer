@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -IS
-"""fuzz-filer: file one private security advisory on nifeos/nife for each held fuzz finding.
+"""fuzz-filer: file one private security advisory on partsfoundry/nife for each held fuzz finding.
 
     fuzz-filer run [--dry-run] [--max N] [--fuzz-home DIR] [--ledger PATH] [--token-file PATH]
                    [--token-group GROUP] [--api URL] [--pace SECONDS] [--rules PATH]
@@ -7,7 +7,7 @@
     fuzz-filer archive [--dry-run] [--fuzz-home DIR] [--rules PATH]
 
 `run` reads the held directory of nife's continuous fuzz supervisor (`<fuzz-home>/state/held/`) and
-its `state/windows.tsv`, and files a draft repository security advisory on nifeos/nife for each held
+its `state/windows.tsv`, and files a draft repository security advisory on partsfoundry/nife for each held
 log that has none yet. It is a plain program, not an agent and not a language model.
 
 - A finding is one held log, named by its content: the first 16 hexadecimal digits of the SHA-256
@@ -65,7 +65,7 @@ log that has none yet. It is a plain program, not an agent and not a language mo
 It reads the `filer` token that `fuzz-token` writes (`/run/fuzz-token/filer.env`) and never the App
 key. It refuses, before it opens the held directory, a token file that is a link, is not owned by
 root, has a mode other than 0440, has a group other than `fuzz-token-filer`, records permissions
-other than `repository_advisories:write` or repositories other than `nifeos/nife`, or expires in
+other than `repository_advisories:write` or repositories other than `partsfoundry/nife`, or expires in
 less than 10 minutes.
 
 It never writes a seed, an input, a held log's name, a panic message or file, a signature's fields
@@ -140,7 +140,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-OWNER = "nifeos"
+OWNER = "partsfoundry"
 REPOSITORY = "nife"
 FULL_NAME = OWNER + "/" + REPOSITORY
 ADVISORIES_PATH = "/repos/%s/%s/security-advisories" % (OWNER, REPOSITORY)
@@ -176,7 +176,7 @@ RATE_FLOOR = 100
 MAX_PAGES = 50
 EX_TEMPFAIL = 75
 
-# The supervisor's names and forms (nifeos/nife, helpers/continuous-fuzz.sh).
+# The supervisor's names and forms (partsfoundry/nife, helpers/continuous-fuzz.sh).
 # A held log's name: the time its window started, then its first seed.
 HELD_NAME = re.compile(r"^([0-9]{8}T[0-9]{6}Z)-([0-9]{1,20})\.log$")
 REPLAY = re.compile(rb"replay: (NIFE_[A-Z_]+_SEEDS)=([0-9]{1,20}):1")

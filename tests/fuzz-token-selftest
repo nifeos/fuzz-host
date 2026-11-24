@@ -146,7 +146,7 @@ def run(tmp, keep_server):
     state = {"mode": "ok", "bodies": [], "jwts": [], "issued": [], "revoked": [],
              "bad_jwt": 0, "expired_jwt": 0, "delete_fails": False, "decoy_hits": 0,
              "get_redirect": False,
-             "repo_listing": ["nifeos/nife"]}
+             "repo_listing": ["partsfoundry/nife"]}
 
     def verify_jwt(jwt):
         parts = jwt.split(".")
@@ -218,13 +218,13 @@ def run(tmp, keep_server):
                                                   for _ in range(3))
             state["issued"].append(token)
             perms = dict(body.get("permissions", {}), metadata="read")
-            repos = [{"full_name": "nifeos/" + r} for r in body.get("repositories", [])]
+            repos = [{"full_name": "partsfoundry/" + r} for r in body.get("repositories", [])]
             if mode == "wider":
                 perms["administration"] = "write"
             if mode == "narrower":
                 perms = {k: "read" for k in perms}
             if mode == "other-repo":
-                repos.append({"full_name": "nifeos/basalt"})
+                repos.append({"full_name": "partsfoundry/basalt"})
             exp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
             answer = {"token": token, "expires_at": exp, "permissions": perms,
                       "repositories": repos, "repository_selection": "selected"}
@@ -384,7 +384,7 @@ def run(tmp, keep_server):
         check("the token file holds the issued token", f.get("GH_TOKEN") == state["issued"][-1])
         check("the token file records permissions and repository",
               f.get("GH_TOKEN_PERMISSIONS") == "contents:write" and
-              f.get("GH_TOKEN_REPOSITORIES") == "nifeos/nife", f)
+              f.get("GH_TOKEN_REPOSITORIES") == "partsfoundry/nife", f)
     check("the token directory is mode 0711",
           stat.S_IMODE(os.lstat(out).st_mode) == 0o711, oct(os.lstat(out).st_mode))
     check("mint prints the path and expiry", "publish.env" in r.stdout and "expires" in r.stdout,
@@ -454,7 +454,7 @@ def run(tmp, keep_server):
           os.access(HELPER, os.X_OK) and open(HELPER).readline() == "#!/usr/bin/python3 -IS\n")
     rc, o, e = check_in_process("publish")
     check("check exits 0 on a fresh token", rc == 0, o + e)
-    check("check prints exactly nifeos/nife", "repositories: nifeos/nife\n" in o, o)
+    check("check prints exactly partsfoundry/nife", "repositories: partsfoundry/nife\n" in o, o)
     check("check prints the expiry", "expires: " in o and "minutes" in o, o)
     r = helper("check", "publish")
     check("check, run directly, refuses a token file not owned by root",
@@ -465,10 +465,10 @@ def run(tmp, keep_server):
     rc, o, e = check_in_process("publish", listxattr=fake_acl(token_file("publish")))
     check("check reports and fails on an ACL on the token file",
           rc == 1 and "acl: system.posix_acl_access" in o and "ACL" in e, o + e)
-    state["repo_listing"] = ["nifeos/nife", "nifeos/basalt"]
+    state["repo_listing"] = ["partsfoundry/nife", "partsfoundry/basalt"]
     rc, o, e = check_in_process("publish")
     check("check fails when the token reaches a second repository", rc == 1, o)
-    state["repo_listing"] = ["nifeos/nife"]
+    state["repo_listing"] = ["partsfoundry/nife"]
     state["get_redirect"] = True
     rc, o, e = check_in_process("publish")
     check("check refuses a redirect from the repository listing",
@@ -643,7 +643,7 @@ def run(tmp, keep_server):
     # 10. Answers that must be refused.
     for mode, word, revoked in (("wider", "administration", True),
                                 ("narrower", "lacks", True),
-                                ("other-repo", "nifeos/basalt", True),
+                                ("other-repo", "partsfoundry/basalt", True),
                                 ("no-repos", "no listed repository", True),
                                 ("no-expiry", "expiry", True),
                                 ("bad-shape", "letters, digits, underscores, hyphens and dots", True),

@@ -3,11 +3,11 @@
 
     sudo fuzz-host-install-rules <commit>
 
-<commit> is a full commit id of nifeos/fuzz-host: 40 lowercase hexadecimal digits, and nothing
+<commit> is a full commit id of partsfoundry/fuzz-host: 40 lowercase hexadecimal digits, and nothing
 else on the command line. The program runs as root, through one sudo rule that lets the fuzz
 account run it (docs/fuzz-filer.md, "Install a merged rules change"). In order, it:
 
-1. takes a lock, fetches main of nifeos/fuzz-host into a root-owned bare clone,
+1. takes a lock, fetches main of partsfoundry/fuzz-host into a root-owned bare clone,
    /var/lib/fuzz-host-install-rules/fuzz-host.git, and refuses the commit unless it is main's head
    as fetched, so a later merged change can never be skipped by naming an earlier one;
 2. refuses the commit when it is older than the one it last installed: the commit it records in
@@ -83,7 +83,7 @@ Config = collections.namedtuple("Config", [
 
 FILER = "/usr/local/bin/fuzz-filer"
 PRODUCTION = Config(
-    origin="https://github.com/nifeos/fuzz-host.git",
+    origin="https://github.com/partsfoundry/fuzz-host.git",
     protocols=("https",),
     state="/var/lib/fuzz-host-install-rules",
     rules="/usr/local/etc/fuzz-filer/rules.tsv",

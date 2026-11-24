@@ -3,7 +3,7 @@
 *Name: provisional, as are the profile names `publish` and `filer`, the unit names and the paths
 `/usr/local/sbin/fuzz-token` and `/run/fuzz-token`.*
 
-The fuzz host acts on nifeos/nife as the `nife-fuzz` GitHub App (App ID 5571801, installation ID
+The fuzz host acts on partsfoundry/nife as the `nife-fuzz` GitHub App (App ID 5571801, installation ID
 177641059; neither is secret). The App's private key sits on the host at
 `/etc/nife-fuzz/nife-fuzz.private-key.pem`, readable by root alone. `fuzz-token` turns that key into
 one-hour installation tokens, one per service, each holding less than the App does:
@@ -18,7 +18,7 @@ the fuzz host. It gives a fix lane a token that reads advisories, on another mac
 [fuzz-token-reader.md](fuzz-token-reader.md) describes it. The code is the same; each profile names
 its App, and the App names its id, its installation and its key path.
 
-GitHub adds Metadata read to every token. Each token reaches nifeos/nife alone. When GitHub's answer
+GitHub adds Metadata read to every token. Each token reaches partsfoundry/nife alone. When GitHub's answer
 grants anything more, or lists any other repository, `fuzz-token` revokes the token and writes
 nothing.
 
@@ -36,7 +36,7 @@ profile's group, mode 0440:
 GH_TOKEN=...
 GH_TOKEN_EXPIRES_AT=2026-11-03T14:00:00Z
 GH_TOKEN_PERMISSIONS=contents:write
-GH_TOKEN_REPOSITORIES=nifeos/nife
+GH_TOKEN_REPOSITORIES=partsfoundry/nife
 ```
 
 The group must hold the reader and no other account, as a listed member or as anyone's primary
@@ -81,7 +81,7 @@ this repository into your own account, not the fuzz account, and review the comm
 ```sh
 sudo groupadd --system fuzz-token-publish
 sudo usermod -a -G fuzz-token-publish lane
-git clone https://github.com/nifeos/fuzz-host.git ~/fuzz-host
+git clone https://github.com/partsfoundry/fuzz-host.git ~/fuzz-host
 git -C ~/fuzz-host checkout --detach <the commit you reviewed>
 ~/fuzz-host/script/test
 sudo install -o root -g root -m 0555 ~/fuzz-host/bin/fuzz-token /usr/local/sbin/fuzz-token
@@ -99,7 +99,7 @@ Verify. After each command, the text after the colon is its expected output:
 - `getent group fuzz-token-publish`: the group with `lane` as its only member.
 - `sudo stat -c '%U %G %a' /run/fuzz-token /run/fuzz-token/publish.env`: `root root 711`, then
   `root fuzz-token-publish 440`.
-- `sudo /usr/local/sbin/fuzz-token check publish`: a `repositories: nifeos/nife` line, an
+- `sudo /usr/local/sbin/fuzz-token check publish`: a `repositories: partsfoundry/nife` line, an
   `expires:` line about an hour ahead, and exit status 0. It never prints the token.
   `sudo /usr/local/sbin/fuzz-token check publish --fresh` mints a token from the key instead, prints
   the permissions GitHub granted, and revokes it. It fails
@@ -107,8 +107,8 @@ Verify. After each command, the text after the colon is its expected output:
   and no POSIX ACL, and prints an `acl:` line when it finds one.
 - `systemctl list-timers 'fuzz-token@*'`: the next run within 20 minutes.
 
-If `check` lists any repository besides nifeos/nife, `mint` would already have refused it, so the
-App's installation changed between the two: set it back to Only select repositories, nifeos/nife
+If `check` lists any repository besides partsfoundry/nife, `mint` would already have refused it, so the
+App's installation changed between the two: set it back to Only select repositories, partsfoundry/nife
 alone, on the installation's settings page. If `mint` fails, `journalctl -u
 fuzz-token@publish.service -n 20` names the refusal: the key's owner or mode, an HTTP status from
 GitHub, a token wider than asked, or a group that holds more than its reader.

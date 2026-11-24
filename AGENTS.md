@@ -1,12 +1,12 @@
 # Working on fuzz-host
 
 This repository holds tooling that runs on the continuous fuzz host for
-[nifeos/nife](https://github.com/nifeos/nife). Some of it runs as root and handles a GitHub App's
+[partsfoundry/nife](https://github.com/partsfoundry/nife). Some of it runs as root and handles a GitHub App's
 private key, so the rules below are stricter than a library's.
 
 ## Rules
 
-- nife's [`AGENTS.md`](https://github.com/nifeos/nife/blob/main/AGENTS.md) governs style and conduct
+- nife's [`AGENTS.md`](https://github.com/partsfoundry/nife/blob/main/AGENTS.md) governs style and conduct
   here by adoption: UTC dates, no em-dashes, no contractions in prose, one purpose per commit with a
   `Co-Authored-By:` trailer, and a pull request an agent writes says so in its first line. Its
   developer-lane rules apply too: claim with a draft pull request, never merge, never poll CI.

@@ -5,7 +5,7 @@
 # Name: provisional.
 [Unit]
 Description=Mint the nife-fuzz %i token
-Documentation=https://github.com/nifeos/fuzz-host/blob/main/docs/fuzz-token.md
+Documentation=https://github.com/partsfoundry/fuzz-host/blob/main/docs/fuzz-token.md
 Wants=network-online.target
 After=network-online.target
 

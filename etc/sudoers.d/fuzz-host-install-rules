@@ -1,5 +1,5 @@
 # fuzz-host-install-rules: the fuzz account may install fuzz-filer's rules from main's head
-# of nifeos/fuzz-host, and nothing else. For classic sudo; docs/fuzz-filer.md, "Install a merged
+# of partsfoundry/fuzz-host, and nothing else. For classic sudo; docs/fuzz-filer.md, "Install a merged
 # rules change", which installs it as /etc/sudoers.d/fuzz-host-install-rules after visudo -c.
 # The argument is 40 lowercase hexadecimal digits, one bracket per digit, and no wildcard that
 # could admit a second argument. The program checks it again.

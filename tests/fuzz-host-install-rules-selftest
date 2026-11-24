@@ -3,7 +3,7 @@
 repository and temporary paths.
 
 No network, no GitHub, no key and no root. The test makes a bare repository standing in for
-nifeos/fuzz-host, commits rules files to its main and to a side branch, and runs the program's
+partsfoundry/fuzz-host, commits rules files to its main and to a side branch, and runs the program's
 main() with a Config of temporary paths, the copy of bin/fuzz-filer as the installed filer, and a
 stand-in for `fuzz-filer archive` that records how it ran. It checks:
 

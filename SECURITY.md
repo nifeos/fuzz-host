@@ -4,9 +4,9 @@ Report a security problem through GitHub's private vulnerability reporting on th
 concerns: the Security tab, "Report a vulnerability".
 
 - A flaw in this repository's own code, for example a way for the mint helper to leak a key or a
-  token, or to mint a token wider than it should: report it here, on nifeos/fuzz-host.
+  token, or to mint a token wider than it should: report it here, on partsfoundry/fuzz-host.
 - A finding the fuzz host makes in nife (a crash, an escape, a shadow-model mismatch): report it on
-  [nifeos/nife](https://github.com/nifeos/nife/security). The host files its own findings there as
+  [partsfoundry/nife](https://github.com/partsfoundry/nife/security). The host files its own findings there as
   private advisories.
 
 Please do not open a public issue for something you believe is exploitable. A real person reads

@@ -1,4 +1,4 @@
-# File one private security advisory on nifeos/nife for each held fuzz finding that has none yet.
+# File one private security advisory on partsfoundry/nife for each held fuzz finding that has none yet.
 # fuzz-filer.timer starts it every 30 minutes. It runs the root-owned copy in /usr/local/bin, never a
 # file in a clone, reads the filer token that fuzz-token@filer.service writes, and keeps its ledger in
 # /var/lib/fuzz-filer. See docs/fuzz-filer.md.
@@ -8,8 +8,8 @@
 # supervisor runs as, the only one that can read the held directory, and the reader fuzz-token gives
 # the filer token by default (docs/fuzz-filer.md, "Which account it runs as").
 [Unit]
-Description=File held fuzz findings as private advisories on nifeos/nife
-Documentation=https://github.com/nifeos/fuzz-host/blob/main/docs/fuzz-filer.md
+Description=File held fuzz findings as private advisories on partsfoundry/nife
+Documentation=https://github.com/partsfoundry/fuzz-host/blob/main/docs/fuzz-filer.md
 Wants=network-online.target fuzz-token@filer.service
 After=network-online.target fuzz-token@filer.service
 

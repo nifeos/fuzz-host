@@ -1,7 +1,7 @@
 # fuzz-host
 
 Tooling for the continuous fuzz host: a dedicated machine that fuzzes
-[nifeos/nife](https://github.com/nifeos/nife) all the time and reports what it finds.
+[partsfoundry/nife](https://github.com/partsfoundry/nife) all the time and reports what it finds.
 
 nife's own tree holds the fuzz drivers and, for now, the supervisor that runs them. This repository
 holds the pieces that run on the host but do not belong to the kernel's tree, starting with code
@@ -15,7 +15,7 @@ The maintainers keep the host's own specification (its name, address and hardwar
 | path | what |
 |---|---|
 | `bin/fuzz-token` | mints one narrowed one-hour installation token of the fuzz host's GitHub App per service, from the App's root-only key ([docs/fuzz-token.md](docs/fuzz-token.md), with the install steps); its `reader` profile gives a fix lane, on the machine that launches it, a one-hour token that reads advisories ([docs/fuzz-token-reader.md](docs/fuzz-token-reader.md)) |
-| `bin/fuzz-filer` | files one private security advisory on nifeos/nife per held fuzz finding, with the `filer` token ([docs/fuzz-filer.md](docs/fuzz-filer.md), with the install steps) |
+| `bin/fuzz-filer` | files one private security advisory on partsfoundry/nife per held fuzz finding, with the `filer` token ([docs/fuzz-filer.md](docs/fuzz-filer.md), with the install steps) |
 | `bin/fuzz-host-install-rules` | installs `etc/fuzz-filer/rules.tsv` from main's head and runs `fuzz-filer archive`, through one narrow sudo rule for the fuzz account ([docs/fuzz-filer.md](docs/fuzz-filer.md#install-a-merged-rules-change), with the install steps) |
 | `etc/sudoers.d/` | that sudo rule, one file for classic sudo and one for sudo-rs |
 | `etc/fuzz-filer/rules.tsv` | the filer's reviewed rules: which causes it never files, and which parked causes it files ([docs/fuzz-filer.md](docs/fuzz-filer.md#rules)) |

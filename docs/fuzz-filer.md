@@ -12,7 +12,7 @@ shadow-model mismatch or an escape), a panic, a guest whose own tick budget ran 
 ran out its bound. It moves the
 window's log into its held directory, `$NIFE_FUZZ_HOME/state/held/`, mode 0700, and writes a row to
 `state/windows.tsv`. An architect ruled on 2026-11-01 (UTC) that a plain program on the host, not
-an agent, files each held finding as a private security advisory on nifeos/nife, and that a fix lane
+an agent, files each held finding as a private security advisory on partsfoundry/nife, and that a fix lane
 reads the advisory and never the held directory. `fuzz-filer` is that program.
 
 The supervisor also replays a red shard of nife's CI fuzz job (`continuous-fuzz.sh --replay`) and
@@ -27,7 +27,7 @@ holds both.
 1. Reads the `filer` token file that `fuzz-token` writes, `/run/fuzz-token/filer.env`, and refuses
    it before it opens anything else unless it is a regular file (not a link) owned by root, mode
    0440, group `fuzz-token-filer`, recording the permissions `repository_advisories:write` and the
-   repositories `nifeos/nife` alone, with at least 10 minutes and at most an hour left. It never
+   repositories `partsfoundry/nife` alone, with at least 10 minutes and at most an hour left. It never
    reads the App key.
 2. Reads the rules file, `/usr/local/etc/fuzz-filer/rules.tsv` (see [Rules](#rules)), and refuses
    the run if it is missing, is not root's, is writable by group or other, is a link, or holds a
@@ -254,7 +254,7 @@ the only account that can read the held directory today: the supervisor makes it
 every window, inside the fuzz account's home, which no other account can enter.
 
 **Accepted risk.** The host runs main's code unattended as that account, and the filer token lets
-its holder create, edit and publish any advisory on nifeos/nife. So code that reaches main runs as
+its holder create, edit and publish any advisory on partsfoundry/nife. So code that reaches main runs as
 an account able to read the filer token, and could publish a held finding before its fix. A
 published advisory cannot be unpublished. The protection is that main requires pull requests and
 checks.
@@ -295,7 +295,7 @@ sudo systemctl start fuzz-token@filer.service
 sudo /usr/local/sbin/fuzz-token check filer
 ```
 
-`check` must print `repositories: nifeos/nife`, `permissions: repository_advisories:write` and an
+`check` must print `repositories: partsfoundry/nife`, `permissions: repository_advisories:write` and an
 expiry about an hour ahead. `sha256sum /usr/local/bin/fuzz-filer ~/fuzz-host/bin/fuzz-filer` must
 print one digest twice: the installed filer is the reviewed one. Then install the rules and look
 before filing:
@@ -336,7 +336,7 @@ Verify. After each command, the text after the colon is its expected output:
   seed, file name or advisory text.
 - `sudo -u lane /usr/local/bin/fuzz-filer ledger`: one `filed` line and one `cause` line per filed
   cause.
-- <https://github.com/nifeos/nife/security/advisories>: one draft per filed cause, made by
+- <https://github.com/partsfoundry/nife/security/advisories>: one draft per filed cause, made by
   `nife-fuzz[bot]`.
 - `sudo systemctl start fuzz-filer.service` again, then the journal: `none to file`, once every
   cause is filed.
@@ -357,7 +357,7 @@ units stay a person's install.
 
 1. refuses every command line but one commit id of 40 lowercase hexadecimal digits;
 2. takes a lock beside its clone, so two runs never overlap, and fetches main of
-   `https://github.com/nifeos/fuzz-host.git` with `/usr/bin/git` into a bare clone it keeps,
+   `https://github.com/partsfoundry/fuzz-host.git` with `/usr/bin/git` into a bare clone it keeps,
    root-owned and mode 0700, at `/var/lib/fuzz-host-install-rules/fuzz-host.git`, with no user or
    system git configuration, no hook, no credential and no automatic garbage collection or
    maintenance. It refuses the commit unless it is main's head as just fetched. The ruling allows
@@ -393,7 +393,7 @@ After the rules pull request merges, as the fuzz account on the fuzz host, with 
 main's head now, which holds every merged rules change (a commit behind the head is refused):
 
 ```sh
-git ls-remote https://github.com/nifeos/fuzz-host.git refs/heads/main
+git ls-remote https://github.com/partsfoundry/fuzz-host.git refs/heads/main
 sudo -n /usr/local/sbin/fuzz-host-install-rules <commit>
 ```
 

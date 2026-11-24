@@ -138,7 +138,7 @@ def run(tmp, keep_server):
     os.chmod(wrapper, 0o755)
 
     state = {"mode": "ok", "bodies": [], "paths": [], "jwts": [], "issued": [], "revoked": [],
-             "bad_jwt": 0, "decoy_hits": 0, "repo_listing": ["nifeos/nife"]}
+             "bad_jwt": 0, "decoy_hits": 0, "repo_listing": ["partsfoundry/nife"]}
 
     def verify_jwt(jwt):
         parts = jwt.split(".")
@@ -190,14 +190,14 @@ def run(tmp, keep_server):
             token = "ghs_reader%d_%s" % (len(state["issued"]), os.urandom(6).hex())
             state["issued"].append(token)
             perms = dict(body.get("permissions", {}), metadata="read")
-            repos = [{"full_name": "nifeos/" + r} for r in body.get("repositories", [])]
+            repos = [{"full_name": "partsfoundry/" + r} for r in body.get("repositories", [])]
             mode = state["mode"]
             if mode == "wider":
                 perms["contents"] = "read"
             if mode == "write":
                 perms["repository_advisories"] = "write"
             if mode == "other-repo":
-                repos.append({"full_name": "nifeos/basalt"})
+                repos.append({"full_name": "partsfoundry/basalt"})
             exp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
             self.reply(201, {"token": token, "expires_at": exp, "permissions": perms,
                              "repositories": repos, "repository_selection": "selected"})
@@ -286,7 +286,7 @@ def run(tmp, keep_server):
     check("standard output is exactly the token and a newline", r.stdout == "%s\n" % token,
           repr(r.stdout[:20]))
     check("standard error names the permission, the repository and the expiry",
-          "repository_advisories:read on nifeos/nife, expires " in r.stderr, r.stderr)
+          "repository_advisories:read on partsfoundry/nife, expires " in r.stderr, r.stderr)
     check("standard error does not hold the token", token not in r.stderr)
     check("the issued token was not revoked", token not in state["revoked"])
     env_lines = open(env_log).read().splitlines() if os.path.exists(env_log) else []
@@ -357,7 +357,7 @@ def run(tmp, keep_server):
 
     # 5. Answers that must be refused, revoked, and never printed.
     for mode, word in (("wider", "contents"), ("write", "repository_advisories:write"),
-                       ("other-repo", "nifeos/basalt")):
+                       ("other-repo", "partsfoundry/basalt")):
         state["mode"] = mode
         n = len(state["issued"])
         r = helper("issue", "reader")
@@ -434,19 +434,19 @@ def run(tmp, keep_server):
     check("check reader --fresh exits 0", r.returncode == 0, r.stdout + r.stderr)
     check("check prints the granted permissions exactly",
           "permissions: metadata:read,repository_advisories:read\n" in r.stdout, r.stdout)
-    check("check prints exactly nifeos/nife", "repositories: nifeos/nife\n" in r.stdout, r.stdout)
+    check("check prints exactly partsfoundry/nife", "repositories: partsfoundry/nife\n" in r.stdout, r.stdout)
     check("check names the reader App and installation",
           "app: nife-fuzz-reader (App ID 5571868, installation 177642435)" in r.stdout, r.stdout)
     check("check prints the expiry", "expires: " in r.stdout, r.stdout)
     check("check revokes its token", len(state["revoked"]) == n_rev + 1 and
           state["revoked"][-1] == state["issued"][-1] and "revoked: yes" in r.stdout, r.stdout)
     check("check never prints its token", state["issued"][-1] not in r.stdout + r.stderr)
-    state["repo_listing"] = ["nifeos/nife", "nifeos/basalt"]
+    state["repo_listing"] = ["partsfoundry/nife", "partsfoundry/basalt"]
     r = helper("check", "reader", "--fresh")
     check("check fails when the token reaches a second repository",
-          r.returncode == 1 and "nifeos/nife alone" in r.stderr and
+          r.returncode == 1 and "partsfoundry/nife alone" in r.stderr and
           state["issued"][-1] in state["revoked"], r.stdout + r.stderr)
-    state["repo_listing"] = ["nifeos/nife"]
+    state["repo_listing"] = ["partsfoundry/nife"]
     state["mode"] = "write"
     r = helper("check", "reader", "--fresh")
     check("check refuses a token granted write", r.returncode == 3 and "write" in r.stderr,
@@ -470,9 +470,9 @@ def run(tmp, keep_server):
     if os.path.exists(os.path.join(out, "reader.env")):
         with open(os.path.join(out, "reader.env")) as f:
             body = f.read()
-        check("the file records advisories read on nifeos/nife",
+        check("the file records advisories read on partsfoundry/nife",
               "GH_TOKEN_PERMISSIONS=repository_advisories:read\n" in body and
-              "GH_TOKEN_REPOSITORIES=nifeos/nife\n" in body)
+              "GH_TOKEN_REPOSITORIES=partsfoundry/nife\n" in body)
     r = helper("profiles", test_flags=False)
     check("profiles lists reader with its App and no default reader",
           "reader\tnife-fuzz-reader\trepository_advisories:read\treader (none)" in r.stdout,
