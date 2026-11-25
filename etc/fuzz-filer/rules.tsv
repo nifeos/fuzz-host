@@ -29,6 +29,7 @@ c96bea4f6081	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastruct
 1fc0510a81e1	suppress	started-before=2026-12-08T00:00:00Z	2026-11-24	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
 3c997b1182be	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
 7adfeea715f4	suppress	started-before=2026-12-08T00:00:00Z	2026-11-23	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
+c5bfa1415d8a	suppress	started-before=2026-12-08T00:00:00Z	2026-11-25	infrastructure: host-wide slowdown bursts under nested virtualization; no kernel defect found; see nifeos/nife#4025
 9757d7187611	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
 b5a849d6d7ae	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
 c500ed04a424	suppress	started-before=2026-11-23T00:00:00Z	2026-11-22	infrastructure: a confined driver wait ran out its tick budget; one build fails or passes by the hour on the host and its held seeds replay clean elsewhere
